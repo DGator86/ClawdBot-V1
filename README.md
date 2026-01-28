@@ -4,17 +4,17 @@ A Telegram AI assistant powered by Claude, built on [moltbot](https://github.com
 
 ## Prerequisites
 
-- AWS VPS (Ubuntu 24.04 recommended)
+- DigitalOcean Droplet (Ubuntu 24.04 recommended)
 - Node.js 22+
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
 - Anthropic API Key (from [console.anthropic.com](https://console.anthropic.com/))
 
 ## Quick Start
 
-### 1. Connect to Your VPS
+### 1. Connect to Your Droplet
 
 ```bash
-ssh -i ~/.ssh/ClawdBot.pem ubuntu@3.14.144.43
+ssh root@165.245.140.115
 ```
 
 ### 2. Clone the Repository
@@ -131,7 +131,7 @@ Once running, interact with your bot in Telegram:
 ### Connection issues
 
 1. Ensure port 18789 is open (for local gateway)
-2. Check AWS security group allows outbound HTTPS (443)
+2. Check DigitalOcean firewall allows outbound HTTPS (443)
 
 ### Restart the bot
 
@@ -139,21 +139,22 @@ Once running, interact with your bot in Telegram:
 sudo systemctl restart clawdbot
 ```
 
-## AWS VPS Details
+## DigitalOcean Droplet Details
 
-- **Instance**: i-09e59d1f0fffc5bed (ClaudeBot)
-- **Public IP**: 3.14.144.43
-- **DNS**: ec2-3-14-144-43.us-east-2.compute.amazonaws.com
-- **Type**: m7i-flex.large (2 vCPUs)
-- **AMI**: Deep Learning OSS Nvidia Driver AMI GPU PyTorch 2.9 (Ubuntu 24.04)
-- **Key Pair**: ClawdBot
+- **Name**: Clawd-Server
+- **Public IP**: 165.245.140.115
+- **Private IP**: 10.128.0.2
+- **Region**: ATL1 (Atlanta)
+- **Specs**: 8 GB Memory / 2 Intel vCPUs / 160 GB Disk
+- **OS**: Ubuntu 24.04 (LTS) x64
+- **VPC Network**: default-atl1 (10.128.0.0/20)
 
 ## Security Notes
 
 - Never commit `.env` or files containing API keys
 - The `.env` file is gitignored by default
-- Use AWS security groups to restrict access
-- Consider enabling AWS CloudWatch for monitoring
+- Use DigitalOcean Cloud Firewalls to restrict access
+- Consider enabling DigitalOcean Monitoring for observability
 
 ## License
 
