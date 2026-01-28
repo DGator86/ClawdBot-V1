@@ -1,0 +1,23 @@
+{
+  "agent": {
+    "model": "anthropic/claude-sonnet-4-20250514",
+    "thinking": "medium"
+  },
+  "gateway": {
+    "port": 18789,
+    "bind": "127.0.0.1"
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "botToken": "${TELEGRAM_BOT_TOKEN}"
+    }
+  },
+  "agents": {
+    "defaults": {
+      "sandbox": {
+        "mode": "disabled"
+      }
+    }
+  }
+}

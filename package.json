@@ -1,0 +1,21 @@
+{
+  "name": "clawdbot",
+  "version": "1.0.0",
+  "description": "ClawdBot - Telegram AI Assistant powered by Claude",
+  "type": "module",
+  "scripts": {
+    "start": "moltbot gateway --port 18789",
+    "start:verbose": "moltbot gateway --port 18789 --verbose",
+    "onboard": "moltbot onboard --install-daemon",
+    "status": "moltbot status",
+    "logs": "journalctl -u clawdbot -f"
+  },
+  "dependencies": {
+    "moltbot": "latest"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "author": "",
+  "license": "MIT"
+}
