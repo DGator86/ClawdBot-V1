@@ -1,0 +1,25 @@
+{
+  "name": "kalshi-crypto-bot",
+  "version": "1.0.0",
+  "description": "Kalshi hourly crypto trading bot with technical analysis",
+  "type": "module",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "analyze": "node src/cli.js analyze",
+    "status": "node src/cli.js status"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "technicalindicators": "^3.1.0",
+    "uuid": "^9.0.0",
+    "ws": "^8.14.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
