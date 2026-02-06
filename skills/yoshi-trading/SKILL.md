@@ -76,7 +76,20 @@ curl -s -X POST http://127.0.0.1:8000/kill-switch
 
 When the user asks to "run a Monte Carlo", "run MC", "simulate", "500k iterations", or anything about Monte Carlo / price simulation:
 
-### Run a Monte Carlo Simulation
+### Run a Monte Carlo Simulation (Live — 12-paradigm ensemble)
+
+**Preferred**: Uses the full 12-module ensemble forecaster with regime-conditioned jump diffusion:
+
+```bash
+cd /root/ClawdBot-V1 && python3 scripts/monte-carlo/simulation.py --live --iterations 500000 --steps 96
+```
+
+With a Kalshi barrier strike:
+```bash
+cd /root/ClawdBot-V1 && python3 scripts/monte-carlo/simulation.py --live --iterations 500000 --barrier 100000
+```
+
+### Run a Monte Carlo Simulation (Legacy — hardcoded prediction)
 
 ```bash
 cd /root/ClawdBot-V1 && python3 scripts/monte-carlo/simulation.py --iterations 500000 --steps 96
@@ -86,6 +99,7 @@ Default is 100,000 iterations and 48 steps. Common requests:
 - "Run 500k MC" → `--iterations 500000`
 - "Run a million iterations" → `--iterations 1000000`
 - "96 step simulation" → `--steps 96`
+- "Run live MC" → `--live` (uses real market data + full ensemble)
 
 The simulation takes a few seconds. **Wait for it to complete** before responding.
 
