@@ -22,5 +22,16 @@ Usage:
     result = fc.forecast("BTCUSDT", horizon_hours=24)
 """
 from .engine import Forecaster, ForecastResult
+from .rl_env import (
+    ForecastTradingEnv,
+    evaluate_forecaster_as_trader,
+    commission_sweep,
+)
 
-__all__ = ["Forecaster", "ForecastResult"]
+__all__ = [
+    "Forecaster",
+    "ForecastResult",
+    "ForecastTradingEnv",
+    "evaluate_forecaster_as_trader",
+    "commission_sweep",
+]

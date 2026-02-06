@@ -29,13 +29,25 @@ from urllib import request, parse as urlparse
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
 _FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
+# Try to use shared utilities
+try:
+    from scripts.lib.pem_utils import fix_pem as _shared_fix_pem, load_env_files as _shared_load_env_files
+    _HAS_SHARED_UTILS = True
+except ImportError:
+    _HAS_SHARED_UTILS = False
+
 
 def load_env():
     """Source .env files for Kalshi credentials.
     
     KALSHI_PRIVATE_KEY is force-overwritten because systemd's
     EnvironmentFile truncates multi-line values to one line.
+    Uses shared pem_utils when available.
     """
+    if _HAS_SHARED_UTILS:
+        _shared_load_env_files()
+        return
+
     for env_path in [
         "/root/Yoshi-Bot/.env",
         "/root/ClawdBot-V1/.env",
@@ -102,12 +114,12 @@ class KalshiClient:
 
     @staticmethod
     def _fix_pem(raw: str) -> str:
-        """Normalize a PEM key that may have been mangled by env var storage."""
+        """Normalize a PEM key. Delegates to shared pem_utils when available."""
+        if _HAS_SHARED_UTILS:
+            return _shared_fix_pem(raw)
         import re
-        # Replace literal \n with real newlines
         if "\\n" in raw:
             raw = raw.replace("\\n", "\n")
-        # Has headers but mangled onto one line
         if "-----BEGIN" in raw and raw.count("\n") <= 2:
             m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
             if m:
@@ -118,7 +130,6 @@ class KalshiClient:
                     lines = [body[i:i+64] for i in range(0, len(body), 64)]
                     raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
             return raw.strip()
-        # NO headers — raw base64 (possibly with spaces)
         if "-----BEGIN" not in raw:
             body = re.sub(r"\s+", "", raw)
             if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):

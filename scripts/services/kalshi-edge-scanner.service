@@ -1,0 +1,30 @@
+[Unit]
+Description=Kalshi Edge Scanner — Continuous Best-Pick Finder
+After=network.target
+Requires=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ClawdBot-V1
+EnvironmentFile=-/root/ClawdBot-V1/.env
+EnvironmentFile=-/root/Yoshi-Bot/.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# Fix PEM keys before start (systemd EnvironmentFile mangles multi-line)
+ExecStartPre=/usr/bin/python3 -c "from scripts.lib.pem_utils import fix_all_pem_files; fix_all_pem_files()"
+
+# Run edge scanner in loop mode (120s interval, top 2 picks)
+ExecStart=/usr/bin/python3 scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2
+
+Restart=always
+RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-scanner
+
+[Install]
+WantedBy=multi-user.target

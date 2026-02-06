@@ -161,153 +161,97 @@ echo "  Google API Key: ${GOOGLE_API_KEY:+${GOOGLE_API_KEY:0:8}...}${GOOGLE_API_
 # ── 7. Fix Kalshi PEM key + write config ──
 echo "7/9 Fixing Kalshi PEM + writing config..."
 
-# Fix PEM key newlines in .env files
-for ENVFILE in /root/Yoshi-Bot/.env /root/ClawdBot-V1/.env; do
-    [ -f "$ENVFILE" ] || continue
-    python3 -c "
-import os, re
-envfile = '$ENVFILE'
-if not os.path.isfile(envfile):
-    exit()
-content = open(envfile).read()
-def fix_pem(m):
-    val = m.group(1)
-    val = val.replace(r'\n', '\n')
-    return 'KALSHI_PRIVATE_KEY=\"' + val + '\"'
-new_content = re.sub(r'KALSHI_PRIVATE_KEY=\"(.+?)\"', fix_pem, content, flags=re.DOTALL)
-if new_content != content:
-    open(envfile, 'w').write(new_content)
-    print(f'  Fixed PEM in: {envfile}')
+# Use shared PEM utility (scripts/lib/pem_utils.py)
+cd /root/ClawdBot-V1
+python3 -c "
+import sys
+sys.path.insert(0, '.')
+try:
+    from scripts.lib.pem_utils import fix_all_pem_files
+    n = fix_all_pem_files(verbose=True)
+    print(f'  Fixed {n} PEM file(s) via shared utility')
+except ImportError:
+    # Fallback: inline PEM fix (if shared utils not yet deployed)
+    import os, re
+    for envfile in ['/root/Yoshi-Bot/.env', '/root/ClawdBot-V1/.env']:
+        if not os.path.isfile(envfile): continue
+        content = open(envfile).read()
+        def fix_pem(m):
+            val = m.group(1)
+            val = val.replace(r'\n', '\n')
+            return 'KALSHI_PRIVATE_KEY=\"' + val + '\"'
+        new = re.sub(r'KALSHI_PRIVATE_KEY=\"(.+?)\"', fix_pem, content, flags=re.DOTALL)
+        if new != content:
+            open(envfile, 'w').write(new)
+            print(f'  Fixed PEM in: {envfile}')
 " 2>/dev/null || true
-done
 
-# Fix standalone PEM file
-if [ -f /root/.kalshi/private_key.pem ]; then
-    python3 -c "
-p = '/root/.kalshi/private_key.pem'
-d = open(p).read()
-if r'\n' in d and '-----BEGIN' in d:
-    open(p, 'w').write(d.replace(r'\n', '\n'))
-    print('  Fixed PEM: ~/.kalshi/private_key.pem')
-" 2>/dev/null || true
-fi
-
-# Write moltbot.json config
+# Write moltbot.json config using shared rebuild-config.py
 export GATEWAY_TOKEN
-python3 << 'PYEOF'
+python3 scripts/rebuild-config.py --gateway-token "$GATEWAY_TOKEN" 2>/dev/null || {
+    # Fallback: inline config writer
+    python3 << 'PYEOF'
 import json, os
 
 google_key = os.environ.get("GOOGLE_API_KEY", "")
-openai_key = os.environ.get("OPENAI_API_KEY", "")
 telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 
 if google_key:
     primary_model = "google/gemini-3-flash-preview"
     fallback_models = ["google/gemini-2.5-flash", "google/gemini-2.5-flash-lite"]
-    print(f"  Model: {primary_model} (Gemini 3 Flash)")
 else:
     primary_model = "openai/gpt-4o-mini"
     fallback_models = ["openai/gpt-4o"]
-    print(f"  Model: {primary_model} (OpenAI fallback)")
 
 config = {
-    "agents": {
-        "defaults": {
-            "workspace": "~/clawd",
-            "model": {
-                "primary": primary_model,
-                "fallbacks": fallback_models
-            },
-            "thinkingDefault": "low"
-        },
-        "list": [{
-            "id": "main",
-            "default": True,
-            "identity": {"name": "ClawdBot", "theme": "crypto trading assistant", "emoji": "\U0001f916"}
-        }]
-    },
-    "gateway": {
-        "mode": "local",
-        "port": 18789,
-        "bind": "loopback",
-        "auth": {"mode": "token", "token": os.environ["GATEWAY_TOKEN"]}
-    },
-    "channels": {
-        "telegram": {
-            "enabled": True,
-            "botToken": telegram_token,
-            "dmPolicy": "open",
-            "allowFrom": ["*"]
-        }
-    },
-    "skills": {
-        "load": {"extraDirs": ["/root/ClawdBot-V1/skills"]}
-    }
+    "agents": {"defaults": {"workspace": "~/clawd", "model": {"primary": primary_model, "fallbacks": fallback_models}, "thinkingDefault": "low"},
+        "list": [{"id": "main", "default": True, "identity": {"name": "ClawdBot", "theme": "crypto trading assistant", "emoji": "\U0001f916"}}]},
+    "gateway": {"mode": "local", "port": 18789, "bind": "loopback", "auth": {"mode": "token", "token": os.environ["GATEWAY_TOKEN"]}},
+    "channels": {"telegram": {"enabled": True, "botToken": telegram_token, "dmPolicy": "open", "allowFrom": ["*"]}},
+    "skills": {"load": {"extraDirs": ["/root/ClawdBot-V1/skills"]}}
 }
-
 if google_key:
     config["env"] = {"GOOGLE_API_KEY": google_key, "GEMINI_API_KEY": google_key}
 
-for cfg_path in [
-    os.path.expanduser("~/.clawdbot/moltbot.json"),
-    os.path.expanduser("~/.moltbot/moltbot.json"),
-]:
+for cfg_path in [os.path.expanduser("~/.clawdbot/moltbot.json"), os.path.expanduser("~/.moltbot/moltbot.json")]:
     os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
     with open(cfg_path, "w") as f:
         json.dump(config, f, indent=2)
     print(f"  Config written: {cfg_path}")
-
-# Verify token in config matches the validated token
-with open(os.path.expanduser("~/.clawdbot/moltbot.json")) as f:
-    d = json.load(f)
-assert d["channels"]["telegram"]["botToken"] == telegram_token, \
-    f"Token mismatch in config! Expected ...{telegram_token[-8:]}"
-assert d["gateway"]["auth"]["token"] == os.environ["GATEWAY_TOKEN"]
-print(f"  Verified: model={primary_model}, token=...{telegram_token[-8:]}")
+print(f"  Model: {primary_model}, token=...{telegram_token[-8:]}")
 PYEOF
+}
 
-# ── 8. Write systemd service + restart ──
-echo "8/9 Writing systemd service + restarting..."
-MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/bin/moltbot")
+# ── 8. Install systemd services + restart ──
+echo "8/9 Installing systemd services + restarting..."
 
-# ExecStartPre kills any stale process on port 18789 before starting
-cat > /etc/systemd/system/clawdbot.service << SVCEOF
-[Unit]
-Description=ClawdBot Telegram AI Trading Assistant
-After=network.target
+# Use the service installer if available, otherwise install inline
+if [ -x /root/ClawdBot-V1/scripts/services/install.sh ]; then
+    bash /root/ClawdBot-V1/scripts/services/install.sh --start
+else
+    MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/local/bin/moltbot")
 
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/root/ClawdBot-V1
-EnvironmentFile=/root/ClawdBot-V1/.env
-Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-Environment=NODE_ENV=production
-Environment=CLAWDBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN
-Environment=GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
-Environment=GEMINI_API_KEY=${GOOGLE_API_KEY:-}
-ExecStartPre=-/usr/bin/fuser -k -9 18789/tcp
-ExecStartPre=/bin/sleep 1
-ExecStart=$MOLTBOT_BIN gateway --port 18789 --token $GATEWAY_TOKEN
-Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=clawdbot
+    # Install service files from scripts/services/ if they exist
+    for SVC in clawdbot kalshi-edge-scanner yoshi-bridge; do
+        SRC="/root/ClawdBot-V1/scripts/services/${SVC}.service"
+        if [ -f "$SRC" ]; then
+            cp "$SRC" "/etc/systemd/system/${SVC}.service"
+            # Fix moltbot path
+            sed -i "s|/usr/local/bin/moltbot|$MOLTBOT_BIN|g" "/etc/systemd/system/${SVC}.service"
+            echo "  Installed: $SVC"
+        fi
+    done
 
-[Install]
-WantedBy=multi-user.target
-SVCEOF
+    # Fix edge scanner python path
+    sed -i "s|/root/Yoshi-Bot/venv/bin/python3|/usr/bin/python3|" \
+        /etc/systemd/system/kalshi-edge-scanner.service 2>/dev/null || true
 
-# Fix edge scanner python path
-sed -i "s|/root/Yoshi-Bot/venv/bin/python3|/usr/bin/python3|" \
-    /etc/systemd/system/kalshi-edge-scanner.service 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl restart clawdbot
+    systemctl restart kalshi-edge-scanner 2>/dev/null || true
+    systemctl restart yoshi-bridge 2>/dev/null || true
+fi
 echo "  Done"
-
-systemctl daemon-reload
-systemctl restart clawdbot
-systemctl restart kalshi-edge-scanner 2>/dev/null || true
-systemctl restart yoshi-bridge 2>/dev/null || true
 
 # ── 9. Post-restart health check ──
 echo "9/9 Verifying services + Telegram connectivity..."
