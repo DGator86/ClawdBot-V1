@@ -267,42 +267,26 @@ fi
 
 chmod 600 "$YOSHI_ENV" 2>/dev/null
 
-# Verify Kalshi using the standalone edge-scanner client (no Yoshi-Bot dependency)
+# Verify Kalshi using the standalone KalshiClient module
 if $KALSHI_CONFIGURED; then
     # Source env so KALSHI_KEY_ID and KALSHI_PRIVATE_KEY are available
     set -a; source "$YOSHI_ENV" 2>/dev/null; set +a
-    # Use the standalone scanner's built-in KalshiClient for verification
+    # Use the shared kalshi_client module for verification
     python3 -c "
-import sys, os, re, json, time, base64
-from urllib import request
-
-# Fix PEM: env vars often store literal \\\\n
-pk = os.environ.get('KALSHI_PRIVATE_KEY', '').strip()
-if '\\\\n' in pk:
-    pk = pk.replace('\\\\n', '\\n')
-    os.environ['KALSHI_PRIVATE_KEY'] = pk
-
-key_id = os.environ.get('KALSHI_KEY_ID', '').strip()
-if not key_id or not pk:
-    print('  \\033[1;33m\\u26a0 Kalshi credentials incomplete, skipping verification\\033[0m')
-    sys.exit(0)
+import sys, os
+sys.path.insert(0, '$CLAWDBOT_DIR/scripts')
 
 try:
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-    private_key = load_pem_private_key(pk.encode(), password=None)
-
-    # Sign and call exchange status
-    ts = str(int(time.time() * 1000))
-    path = '/exchange/status'
-    msg = ts + 'GET' + path
-    sig = private_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
-    headers = {'KALSHI-ACCESS-KEY': key_id, 'KALSHI-ACCESS-SIGNATURE': base64.b64encode(sig).decode(), 'KALSHI-ACCESS-TIMESTAMP': ts}
-    req = request.Request('https://api.elections.kalshi.com/trade-api/v2' + path, headers=headers)
-    with request.urlopen(req, timeout=10) as resp:
-        data = json.loads(resp.read().decode())
-    print(f'  \\033[0;32m\\u2713 Kalshi CONNECTED (exchange={data.get(\"exchange_active\")}, trading={data.get(\"trading_active\")})\\033[0m')
+    from kalshi_client import KalshiClient
+    
+    # Instantiate client and test connection
+    client = KalshiClient()
+    status = client.get_exchange_status()
+    
+    if status:
+        print(f'  \\033[0;32m\\u2713 Kalshi CONNECTED (exchange={status.get(\"exchange_active\")}, trading={status.get(\"trading_active\")})\\033[0m')
+    else:
+        print('  \\033[1;33m\\u26a0 Kalshi API call failed\\033[0m')
 except Exception as e:
     print(f'  \\033[0;31m\\u2717 Kalshi verify error: {e}\\033[0m')
 " 2>/dev/null || warn "Could not verify Kalshi (missing cryptography? Run: pip3 install cryptography)"
@@ -383,6 +367,9 @@ rm -rf /root/.moltbot 2>/dev/null  # remove old state dir that triggers doctor w
 # Generate gateway auth token
 GATEWAY_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
 
+# Load allowlist from environment or use a secure default
+TELEGRAM_ALLOWLIST="${TELEGRAM_ALLOWLIST:-}"
+
 cat > ~/.clawdbot/moltbot.json << MOLTEOF
 {
   "agents": {
@@ -419,7 +406,7 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
       "enabled": true,
       "botToken": "$TELEGRAM_BOT_TOKEN",
       "dmPolicy": "open",
-      "allowFrom": ["*"]
+      "allowFrom": $(if [ -n "$TELEGRAM_ALLOWLIST" ]; then echo "[\"$(echo $TELEGRAM_ALLOWLIST | sed 's/,/\",\"/g')\"]"; else echo "[]"; fi)
     }
   },
   "skills": {
@@ -465,7 +452,7 @@ EnvironmentFile=$CLAWDBOT_DIR/.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=CLAWDBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN
-ExecStart=$MOLTBOT_BIN gateway --port 18789 --token $GATEWAY_TOKEN
+ExecStart=$MOLTBOT_BIN gateway --port 18789
 Restart=always
 RestartSec=10
 StandardOutput=journal

@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, error as urlerror, parse as urlparse
 
+from kalshi_client import KalshiClient
+
 # ── Config ───────────────────────────────────────────────
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://127.0.0.1:8000")
 STATE_DIR = Path(__file__).parent.parent  # ClawdBot-V1 root
@@ -75,8 +77,6 @@ def log(msg: str, level: str = "INFO"):
 
 
 # ── .env loader ──────────────────────────────────────────
-# Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
-_FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
 
 def _source_env(path: str):
@@ -85,6 +85,9 @@ def _source_env(path: str):
     KALSHI_PRIVATE_KEY is force-overwritten because systemd's
     EnvironmentFile truncates multi-line values to one line.
     """
+    # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
+    FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
+    
     try:
         with open(path) as f:
             for raw in f:
@@ -108,7 +111,7 @@ def _source_env(path: str):
                 else:
                     val = val.strip('"').strip("'")
                 if key and val:
-                    if key in _FORCE_OVERWRITE_KEYS:
+                    if key in FORCE_OVERWRITE_KEYS:
                         os.environ[key] = val  # overwrite systemd's truncated value
                     else:
                         os.environ.setdefault(key, val)
@@ -116,140 +119,8 @@ def _source_env(path: str):
         pass
 
 
-# ── Standalone Kalshi API Client ─────────────────────────
-class KalshiClient:
-    """
-    Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth.
-    No external dependencies beyond `cryptography` (system package).
-    
-    Reads KALSHI_KEY_ID and KALSHI_PRIVATE_KEY from environment.
-    """
-    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-
-    def __init__(self):
-        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
-        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
-        if not self.key_id:
-            raise ValueError("KALSHI_KEY_ID not set")
-        if not pk_raw:
-            # Try loading from file
-            for pk_path in [
-                os.path.expanduser("~/.kalshi/private_key.pem"),
-                "/root/.kalshi/private_key.pem",
-            ]:
-                if os.path.isfile(pk_path):
-                    with open(pk_path) as f:
-                        pk_raw = f.read().strip()
-                    break
-        if not pk_raw:
-            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
-
-        # Fix PEM formatting — env vars often have literal \n instead of newlines
-        pk_raw = self._fix_pem(pk_raw)
-
-        # Load the RSA private key
-        try:
-            from cryptography.hazmat.primitives.serialization import load_pem_private_key
-            self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
-        except ImportError:
-            raise ImportError(
-                "cryptography package not installed. Run: pip3 install cryptography"
-            )
-
-    @staticmethod
-    def _fix_pem(raw: str) -> str:
-        """
-        Normalize a PEM key that may have been mangled by env var storage.
-        Handles:
-          - literal \\n instead of real newlines
-          - single-line PEM with headers but no line breaks
-          - raw base64 with NO headers at all (spaces instead of newlines)
-          - raw base64 with no whitespace at all
-        """
-        import re
-
-        # Replace literal \n with real newlines
-        if "\\n" in raw:
-            raw = raw.replace("\\n", "\n")
-
-        # If it has PEM headers but is mangled onto one/two lines
-        if "-----BEGIN" in raw and raw.count("\n") <= 2:
-            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
-            if m:
-                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
-                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
-                if header_match and footer_match:
-                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
-                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
-                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
-            return raw.strip()
-
-        # NO PEM headers — raw base64 (possibly with spaces instead of newlines)
-        if "-----BEGIN" not in raw:
-            # Strip all whitespace to get clean base64
-            body = re.sub(r"\s+", "", raw)
-            # Validate it looks like base64
-            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
-                # Wrap at 64 chars and add RSA PRIVATE KEY headers
-                lines = [body[i:i+64] for i in range(0, len(body), 64)]
-                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
-
-        return raw.strip()
-
-    def _sign(self, method: str, path: str, body: str = "") -> dict:
-        """Create authenticated headers for a Kalshi API request."""
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-
-        timestamp = str(int(time.time() * 1000))
-        message = timestamp + method + path + body
-        signature = self.private_key.sign(
-            message.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-        return {
-            "Content-Type": "application/json",
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        }
-
-    def _request(self, method: str, path: str, body: str = ""):
-        """Make an authenticated HTTP request to Kalshi."""
-        headers = self._sign(method, path, body)
-        url = self.BASE_URL + path
-        data = body.encode() if body else None
-        req = request.Request(url, data=data, headers=headers, method=method)
-        try:
-            with request.urlopen(req, timeout=15) as resp:
-                return json.loads(resp.read().decode())
-        except Exception as e:
-            log(f"Kalshi API error ({method} {path}): {e}", "ERROR")
-            return None
-
-    def get_exchange_status(self) -> dict | None:
-        return self._request("GET", "/exchange/status")
-
-    def list_markets(self, limit: int = 200, **kwargs) -> list[dict]:
-        params = {"limit": str(limit)}
-        for k, v in kwargs.items():
-            params[k] = str(v)
-        qs = urlparse.urlencode(params)
-        result = self._request("GET", f"/markets?{qs}")
-        if result and "markets" in result:
-            return result["markets"]
-        return result if isinstance(result, list) else []
-
-    def get_market(self, ticker: str) -> dict | None:
-        return self._request("GET", f"/markets/{ticker}")
-
-
 def load_kalshi_client():
-    """Load env files and return the KalshiClient class."""
+    """Load env files and return a configured KalshiClient instance."""
     # Source all known .env files for credentials
     for env_path in [
         "/root/Yoshi-Bot/.env",
@@ -265,14 +136,13 @@ def load_kalshi_client():
     if not os.environ.get("KALSHI_KEY_ID"):
         raise ImportError("KALSHI_KEY_ID not found in any .env file")
 
-    # Test that we can create a client
+    # Create and return the client instance
     try:
         client = KalshiClient()
         log(f"Kalshi client initialized (key: {client.key_id[:12]}...)")
+        return client
     except Exception as e:
-        raise ImportError(f"Cannot create Kalshi client: {e}")
-
-    return KalshiClient  # Return the class, not instance
+        raise ImportError(f"Cannot create Kalshi client: {e}") from e
 
 
 # ── Price fetching (lightweight, no ccxt dependency) ─────
@@ -525,7 +395,7 @@ def propose_to_core(pick: dict) -> dict | None:
 
 
 # ── Scanner Main Loop ────────────────────────────────────
-def scan_once(kalshi_client, top_n: int = 2) -> list[dict]:
+def scan_once(client: KalshiClient, top_n: int = 2) -> list[dict]:
     """
     Run one full scan cycle:
     1. Check exchange status
@@ -534,7 +404,6 @@ def scan_once(kalshi_client, top_n: int = 2) -> list[dict]:
     4. Score every contract
     5. Return top N picks sorted by composite score
     """
-    client = kalshi_client()
 
     # 1. Exchange status
     ex_status = client.get_exchange_status()
@@ -675,7 +544,7 @@ def main():
 
     # Load Kalshi client
     try:
-        KalshiClient = load_kalshi_client()
+        client = load_kalshi_client()
     except ImportError as e:
         log(str(e), "FATAL")
         sys.exit(1)
@@ -689,7 +558,7 @@ def main():
         log(f"--- Scan #{cycle} ---")
 
         try:
-            picks = scan_once(KalshiClient, top_n=args.top)
+            picks = scan_once(client, top_n=args.top)
         except Exception as e:
             log(f"Scan failed: {e}", "ERROR")
             picks = []

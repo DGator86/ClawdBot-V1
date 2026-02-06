@@ -27,10 +27,24 @@ if fuser 18789/tcp 2>/dev/null; then
 fi
 echo "  Done"
 
-# ── 2. Nuke ALL stale moltbot state ──
+# ── 2. Nuke ALL stale moltbot state (with backup) ──
 echo "2/8 Cleaning state..."
-rm -rf /root/.moltbot
-rm -rf /root/.clawdbot
+# Backup and remove directories with confirmation
+FORCE_NUKE="${FORCE_NUKE:-}"
+for DIR in /root/.moltbot /root/.clawdbot; do
+    if [ -d "$DIR" ]; then
+        if [ -z "$FORCE_NUKE" ]; then
+            # Create timestamped backup
+            BACKUP_DIR="${DIR}.bak.$(date +%s)"
+            mv "$DIR" "$BACKUP_DIR" 2>/dev/null || true
+            echo "  Backed up $DIR to $BACKUP_DIR"
+        else
+            # Force removal without backup
+            rm -rf "$DIR" 2>/dev/null || true
+            echo "  Removed $DIR (FORCE_NUKE set)"
+        fi
+    fi
+done
 mkdir -p /root/.clawdbot
 chmod 700 /root/.clawdbot
 echo "  Done"
@@ -38,8 +52,10 @@ echo "  Done"
 # ── 3. Pull latest code ──
 echo "3/8 Updating code..."
 cd /root/ClawdBot-V1 || { echo "ERROR: /root/ClawdBot-V1 not found"; exit 1; }
+# Use branch from argument or env var, defaulting to main
+BRANCH="${1:-${TARGET_BRANCH:-main}}"
 git fetch origin 2>/dev/null || true
-git reset --hard origin/genspark_ai_developer 2>/dev/null || true
+git reset --hard "origin/$BRANCH" 2>/dev/null || true
 echo "  HEAD: $(git log --oneline -1)"
 
 # ── 4. Install cryptography for Kalshi API ──
@@ -69,12 +85,6 @@ echo "6/8 Fixing Kalshi key + writing config..."
 # Fix the PEM key in all .env files — many tools store PEM as single-line with literal \n
 for ENVFILE in /root/Yoshi-Bot/.env /root/ClawdBot-V1/.env; do
     [ -f "$ENVFILE" ] || continue
-    python3 << 'PEMFIX'
-import re, os, sys
-
-envfile = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ENVFILE", "")
-# Read from env var set in the loop
-PEMFIX
 
     # Use python to fix PEM in .env file
     python3 -c "
@@ -87,10 +97,10 @@ content = open(envfile).read()
 import re
 def fix_pem(m):
     val = m.group(1)
-    # Replace literal \\\\n with real newlines
+    # Replace literal \\\\n with real newlines (double backslash)
     val = val.replace('\\\\n', '\n')
     # Also handle cases where it's just \\n (single backslash)
-    val = val.replace('\\\\n', '\n')
+    val = val.replace('\\n', '\n')
     return 'KALSHI_PRIVATE_KEY=\"' + val + '\"'
 content = re.sub(r'KALSHI_PRIVATE_KEY=\"(.+?)\"', fix_pem, content, flags=re.DOTALL)
 open(envfile, 'w').write(content)
@@ -125,6 +135,22 @@ else:
     fallback_models = ["openai/gpt-4o"]
     print(f"  Model: {primary_model} (OpenAI fallback)")
 
+# Load allowlist from environment or use a secure default
+allowFrom = os.environ.get("TELEGRAM_ALLOWLIST", "").strip()
+if allowFrom:
+    # Parse comma-separated list of user IDs
+    allowFrom = [x.strip() for x in allowFrom.split(",") if x.strip()]
+else:
+    # Default: require explicit configuration to avoid open access
+    allowFrom = []
+
+# Validate allowlist
+if not allowFrom or allowFrom == ["*"]:
+    print("  WARNING: No valid Telegram allowlist configured!")
+    print("  Set TELEGRAM_ALLOWLIST env var with comma-separated user IDs")
+    print("  Defaulting to empty allowlist (will reject all DMs)")
+    allowFrom = []
+
 config = {
     "agents": {
         "defaults": {
@@ -152,7 +178,7 @@ config = {
             "enabled": True,
             "botToken": os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             "dmPolicy": "open",
-            "allowFrom": ["*"]
+            "allowFrom": allowFrom
         }
     },
     "skills": {
@@ -180,7 +206,7 @@ with open(os.path.expanduser("~/.clawdbot/moltbot.json")) as f:
 assert d["gateway"]["mode"] == "local"
 assert d["gateway"]["auth"]["token"] == os.environ["GATEWAY_TOKEN"]
 assert d["agents"]["defaults"]["model"]["primary"] == primary_model
-print(f"  Verified: model={primary_model}")
+print(f"  Verified: model={primary_model}, allowlist={len(allowFrom)} users")
 PYEOF
 
 # ── 7. Write systemd services ──
@@ -202,7 +228,7 @@ Environment=NODE_ENV=production
 Environment=CLAWDBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN
 Environment=GOOGLE_API_KEY=${GOOGLE_API_KEY:-}
 Environment=GEMINI_API_KEY=${GOOGLE_API_KEY:-}
-ExecStart=$MOLTBOT_BIN gateway --port 18789 --token $GATEWAY_TOKEN
+ExecStart=$MOLTBOT_BIN gateway --port 18789
 Restart=always
 RestartSec=10
 StandardOutput=journal

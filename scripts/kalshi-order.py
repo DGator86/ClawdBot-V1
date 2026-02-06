@@ -18,12 +18,12 @@ Standalone — no Yoshi-Bot dependency. Requires: cryptography (pip3 install cry
 """
 
 import argparse
-import base64
 import json
+import logging
 import os
 import sys
-import time
-from urllib import request, parse as urlparse
+
+from kalshi_client import KalshiClient
 
 
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
@@ -69,91 +69,11 @@ def load_env():
                                 os.environ[key] = val
                             else:
                                 os.environ.setdefault(key, val)
-            except Exception:
-                pass
-
-
-class KalshiClient:
-    """Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth."""
-    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-
-    def __init__(self):
-        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
-        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
-        if not self.key_id:
-            raise ValueError("KALSHI_KEY_ID not set")
-        if not pk_raw:
-            for pk_path in [
-                os.path.expanduser("~/.kalshi/private_key.pem"),
-                "/root/.kalshi/private_key.pem",
-            ]:
-                if os.path.isfile(pk_path):
-                    with open(pk_path) as f:
-                        pk_raw = f.read().strip()
-                    break
-        if not pk_raw:
-            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
-
-        # Fix PEM formatting — env vars often have literal \n instead of newlines
-        pk_raw = self._fix_pem(pk_raw)
-
-        from cryptography.hazmat.primitives.serialization import load_pem_private_key
-        self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
-
-    @staticmethod
-    def _fix_pem(raw: str) -> str:
-        """Normalize a PEM key that may have been mangled by env var storage."""
-        import re
-        # Replace literal \n with real newlines
-        if "\\n" in raw:
-            raw = raw.replace("\\n", "\n")
-        # Has headers but mangled onto one line
-        if "-----BEGIN" in raw and raw.count("\n") <= 2:
-            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
-            if m:
-                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
-                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
-                if header_match and footer_match:
-                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
-                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
-                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
-            return raw.strip()
-        # NO headers — raw base64 (possibly with spaces)
-        if "-----BEGIN" not in raw:
-            body = re.sub(r"\s+", "", raw)
-            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
-                lines = [body[i:i+64] for i in range(0, len(body), 64)]
-                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
-        return raw.strip()
-
-    def _sign(self, method: str, path: str, body: str = "") -> dict:
-        from cryptography.hazmat.primitives import hashes
-        from cryptography.hazmat.primitives.asymmetric import padding
-
-        timestamp = str(int(time.time() * 1000))
-        message = timestamp + method + path + body
-        signature = self.private_key.sign(
-            message.encode(),
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH,
-            ),
-            hashes.SHA256(),
-        )
-        return {
-            "Content-Type": "application/json",
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
-            "KALSHI-ACCESS-TIMESTAMP": timestamp,
-        }
-
-    def _request(self, method: str, path: str, body: str = ""):
-        headers = self._sign(method, path, body)
-        url = self.BASE_URL + path
-        data = body.encode() if body else None
-        req = request.Request(url, data=data, headers=headers, method=method)
-        with request.urlopen(req, timeout=15) as resp:
-            return json.loads(resp.read().decode())
+            except Exception as e:
+                # Don't swallow env-loading errors silently
+                logging.warning(f"Failed to load .env from {env_path}: {e}")
+                import traceback
+                logging.debug(traceback.format_exc())
 
 
 def place_order(client, ticker, side, count, order_type="market", price=None):
@@ -197,16 +117,16 @@ def main():
         sys.exit(1)
 
     if args.positions:
-        result = client._request("GET", "/portfolio/positions?limit=100")
+        result = client.get_positions(limit=100)
         print(json.dumps(result, indent=2))
     elif args.orders:
-        result = client._request("GET", "/portfolio/orders?status=resting")
+        result = client.list_orders(status="resting")
         print(json.dumps(result, indent=2))
     elif args.balance:
-        result = client._request("GET", "/portfolio/balance")
+        result = client.get_balance()
         print(json.dumps(result, indent=2))
     elif args.cancel:
-        result = client._request("DELETE", f"/portfolio/orders/{args.cancel}")
+        result = client.cancel_order(args.cancel)
         print(json.dumps(result, indent=2))
     elif args.ticker and args.side:
         print(f"Placing order: {args.count}x {args.side.upper()} on {args.ticker} ({args.type})")
@@ -215,7 +135,7 @@ def main():
         print(json.dumps(result, indent=2))
         if isinstance(result, dict) and "order" in result:
             order = result["order"]
-            print(f"\n Order placed!")
+            print("\n Order placed!")
             print(f"   Order ID: {order.get('order_id')}")
             print(f"   Status:   {order.get('status')}")
         elif isinstance(result, dict) and ("error" in result or "code" in result):
