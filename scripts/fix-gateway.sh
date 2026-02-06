@@ -117,9 +117,9 @@ google_key = os.environ.get("GOOGLE_API_KEY", "")
 openai_key = os.environ.get("OPENAI_API_KEY", "")
 
 if google_key:
-    primary_model = "google/gemini-2.0-flash"
-    fallback_models = ["google/gemini-2.0-flash-lite"]
-    print(f"  Model: {primary_model} (Google Gemini — free tier)")
+    primary_model = "google/gemini-3-flash-preview"
+    fallback_models = ["google/gemini-2.5-flash", "google/gemini-2.5-flash-lite"]
+    print(f"  Model: {primary_model} (Gemini 3 Flash — free tier)")
 else:
     primary_model = "openai/gpt-4o-mini"
     fallback_models = ["openai/gpt-4o"]
