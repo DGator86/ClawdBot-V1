@@ -1,13 +1,41 @@
 # ClawdBot
 
-A Telegram AI assistant powered by Claude, built on [moltbot](https://github.com/moltbot/moltbot).
+A Telegram AI trading assistant built on [moltbot](https://github.com/moltbot/moltbot). ClawdBot reads signals from [Yoshi-Bot](https://github.com/DGator86/Yoshi-Bot) and presents actionable Kalshi trade suggestions via Telegram.
+
+## Architecture
+
+```
+Yoshi-Bot (Signal Engine)              ClawdBot (Telegram Interface)
+========================              ============================
+
+kalshi_scanner.py (loop)              moltbot gateway :18789
+  | Fetches OHLCV data                  | yoshi-trading skill
+  | Runs PriceTimeManifold              | Reads Trading Core API
+  | Finds Kalshi edge opportunities     | Formats trade suggestions
+  | Writes to scanner.log               | Sends to Telegram
+  v                                     v
+yoshi-bridge.py                       You (Telegram)
+  | Watches scanner.log                 | "What's Yoshi's status?"
+  | Parses signals (edge, strike, etc)  | "Show me positions"
+  | POSTs to Trading Core /propose      | "approve" / "pass"
+  v                                     |
+Trading Core API :8000  <---------------+
+  /status    /positions
+  /propose   /approve/{id}
+  /orders    /kill-switch
+  /pause     /resume
+  /flatten
+```
 
 ## Prerequisites
 
-- DigitalOcean Droplet (Ubuntu 24.04 recommended)
+- DigitalOcean Droplet or any Linux server (Ubuntu 24.04 recommended)
 - Node.js 22+
+- Python 3.10+
 - Telegram Bot Token (from [@BotFather](https://t.me/BotFather))
-- Anthropic API Key (from [console.anthropic.com](https://console.anthropic.com/))
+- OpenAI API Key (from [platform.openai.com](https://platform.openai.com/))
+- Kalshi API credentials (from [kalshi.com/account/api](https://kalshi.com/account/api))
+- Yoshi-Bot deployed with Trading Core running on port 8000
 
 ## Quick Start
 
@@ -24,49 +52,46 @@ git clone https://github.com/DGator86/ClawdBot-V1.git
 cd ClawdBot-V1
 ```
 
-### 3. Run Deployment Script
+### 3. Configure Environment
 
 ```bash
-chmod +x scripts/*.sh
-./scripts/deploy.sh
-```
-
-### 4. Configure Your Bot
-
-```bash
-./scripts/setup-telegram.sh
-```
-
-Or manually edit the files:
-
-```bash
-# Set your API keys
+cp .env.example .env
 nano .env
-
-# Configure moltbot
-nano ~/.clawdbot/moltbot.json
+# Set TELEGRAM_BOT_TOKEN, OPENAI_API_KEY, KALSHI_KEY_ID, KALSHI_PRIVATE_KEY
 ```
 
-### 5. Start the Bot
+### 4. Deploy the Bridge
 
 ```bash
-# Start as a service (recommended)
-sudo systemctl start clawdbot
-sudo systemctl enable clawdbot  # auto-start on boot
-
-# Or run manually
-source .env && moltbot gateway --port 18789 --verbose
+chmod +x scripts/deploy-bridge.sh
+./scripts/deploy-bridge.sh
 ```
 
-### 6. Check Status
+This installs and starts:
+- **clawdbot** service (moltbot gateway + Telegram + yoshi-trading skill)
+- **yoshi-bridge** service (scanner log watcher -> Trading Core /propose)
 
-```bash
-# View logs
-sudo journalctl -u clawdbot -f
+The deploy script will also prompt for Kalshi API credentials if not already configured.
 
-# Check service status
-sudo systemctl status clawdbot
-```
+### 5. Talk to Your Bot
+
+Open Telegram and message your bot:
+- "What's Yoshi's status?"
+- "Show me open positions"
+- "Any Kalshi signals?"
+- "Check Kalshi exchange status"
+- "Pause trading"
+- "Activate kill switch"
+
+## Services
+
+| Service | Port | Description |
+|---------|------|-------------|
+| Yoshi Trading Core | 8000 | FastAPI order management, positions, risk controls |
+| ClawdBot Gateway | 18789 | Moltbot AI gateway + Telegram channel |
+| Yoshi Bridge | — | Log watcher, forwards scanner signals to Trading Core |
+| Kalshi Scanner | — | Background signal engine (part of Yoshi-Bot) |
+| Kalshi API | — | Prediction market data (RSA-PSS V2 auth) |
 
 ## Configuration
 
@@ -74,18 +99,22 @@ sudo systemctl status clawdbot
 
 | Variable | Description | Required |
 |----------|-------------|----------|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key | Yes |
 | `TELEGRAM_BOT_TOKEN` | Your Telegram bot token | Yes |
-| `OPENAI_API_KEY` | OpenAI API key (optional) | No |
-| `ELEVENLABS_API_KEY` | ElevenLabs API key for voice | No |
+| `OPENAI_API_KEY` | OpenAI API key (for ClawdBot reasoning) | Yes |
+| `KALSHI_KEY_ID` | Kalshi API Key ID | Yes |
+| `KALSHI_PRIVATE_KEY` | Kalshi RSA private key (PEM format) | Yes |
+| `ANTHROPIC_API_KEY` | Anthropic API key (alternative provider) | No |
+| `DIGITALOCEAN_TOKEN` | DO API token (for VPS health monitoring) | No |
+| `TELEGRAM_CHAT_ID` | Telegram chat ID (for alert notifications) | No |
 
 ### Moltbot Configuration (~/.clawdbot/moltbot.json)
 
 ```json
 {
   "agent": {
-    "model": "anthropic/claude-sonnet-4-20250514",
-    "thinking": "medium"
+    "model": "openai/gpt-4o",
+    "thinking": "medium",
+    "systemPrompt": "You are ClawdBot, a crypto trading assistant..."
   },
   "gateway": {
     "port": 18789,
@@ -96,13 +125,66 @@ sudo systemctl status clawdbot
       "enabled": true,
       "botToken": "YOUR_TELEGRAM_BOT_TOKEN"
     }
+  },
+  "skills": {
+    "load": {
+      "extraDirs": ["./skills"]
+    }
   }
 }
 ```
 
-## Telegram Commands
+### Yoshi-Trading Skill
 
-Once running, interact with your bot in Telegram:
+The `skills/yoshi-trading/SKILL.md` teaches ClawdBot how to:
+- Query Yoshi's Trading Core API (status, positions, health)
+- Query Kalshi markets directly (exchange status, active markets, series)
+- Parse Kalshi scanner signals from logs
+- Propose and approve trades through the Trading Core
+- Manage risk controls (pause, resume, flatten, kill switch)
+- Format Kalshi suggestions with edge %, strike, and action
+
+## Kalshi Integration
+
+ClawdBot connects to Kalshi prediction markets through Yoshi-Bot's signal engine. The integration uses the Kalshi V2 API with RSA-PSS authentication.
+
+### How It Works
+
+1. **Yoshi-Bot** (`kalshi_scanner.py`) continuously scans Kalshi crypto markets (KXBTC, KXETH) for mispriced opportunities using the Price-Time Manifold model with Monte Carlo simulations (2000 sims per timeframe).
+2. **Yoshi-Bridge** (`yoshi-bridge.py`) watches the scanner log and forwards qualifying signals (edge >= 5%) to the Trading Core `/propose` endpoint.
+3. **ClawdBot** reads the Trading Core API and presents actionable Kalshi suggestions via Telegram, complete with edge %, strike, probability, and recommended action.
+4. **You** review and approve/reject trades via Telegram.
+
+### Kalshi API Setup
+
+1. Get your API credentials from [Kalshi Account API](https://kalshi.com/account/api)
+2. Add credentials to Yoshi-Bot's `.env`:
+   ```bash
+   KALSHI_KEY_ID=your_key_id_here
+   KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+   ... your key ...
+   -----END RSA PRIVATE KEY-----"
+   ```
+3. Or use a PEM file: store at `~/.kalshi/private_key.pem` (chmod 600)
+4. The deploy script (`scripts/deploy-bridge.sh`) will prompt for these during setup
+
+### Supported Kalshi Markets
+
+| Series | Symbol | Description |
+|--------|--------|-------------|
+| KXBTC | BTCUSDT | Bitcoin hourly price contracts |
+| KXETH | ETHUSDT | Ethereum hourly price contracts |
+
+### Kalshi Commands via Telegram
+
+Ask ClawdBot in natural language:
+- "Check Kalshi exchange status"
+- "Show me active BTC Kalshi markets"
+- "What Kalshi signals does Yoshi have?"
+- "Is Kalshi API connected?"
+- "Show Kalshi market for KXBTC-25FEB06-T100000"
+
+## Telegram Commands
 
 | Command | Description |
 |---------|-------------|
@@ -112,31 +194,110 @@ Once running, interact with your bot in Telegram:
 | `/verbose on\|off` | Toggle verbose mode |
 | `/restart` | Restart the gateway |
 
-## Troubleshooting
+Plus natural language queries like:
+- "What's Yoshi doing?"
+- "Show positions"
+- "Propose a BTC trade"
+- "Kill switch NOW"
 
-### Bot not responding
+## Kalshi Integration
 
-1. Check if the service is running:
+ClawdBot connects to Kalshi prediction markets through Yoshi-Bot's signal engine. The integration uses the Kalshi V2 API with RSA-PSS authentication.
+
+### How It Works
+
+1. **Yoshi-Bot** (`kalshi_scanner.py`) continuously scans Kalshi crypto markets (KXBTC, KXETH) for mispriced opportunities using the Price-Time Manifold model with Monte Carlo simulations (2000 sims per timeframe).
+2. **Yoshi-Bridge** (`yoshi-bridge.py`) watches the scanner log and forwards qualifying signals (edge >= 5%) to the Trading Core `/propose` endpoint.
+3. **ClawdBot** reads the Trading Core API and presents actionable Kalshi suggestions via Telegram, complete with edge %, strike, probability, and recommended action.
+4. **You** review and approve/reject trades via Telegram.
+
+### Kalshi API Setup
+
+1. Get your API credentials from [Kalshi Account API](https://kalshi.com/account/api)
+2. Add credentials to Yoshi-Bot's `.env`:
    ```bash
-   sudo systemctl status clawdbot
+   KALSHI_KEY_ID=6858062e-6884-43b5-b002-0e13391be331
+   KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
+   ... your key ...
+   -----END RSA PRIVATE KEY-----"
    ```
+3. Or use a PEM file: store at `~/.kalshi/private_key.pem` (chmod 600)
+4. The deploy script (`scripts/deploy-bridge.sh`) will prompt for these during setup
 
-2. Check logs for errors:
-   ```bash
-   sudo journalctl -u clawdbot -n 100
-   ```
+### Supported Kalshi Markets
 
-3. Verify your tokens are correct in `.env`
+| Series | Symbol | Description |
+|--------|--------|-------------|
+| KXBTC | BTCUSDT | Bitcoin hourly price contracts |
+| KXETH | ETHUSDT | Ethereum hourly price contracts |
 
-### Connection issues
+### Kalshi Commands via Telegram
 
-1. Ensure port 18789 is open (for local gateway)
-2. Check DigitalOcean firewall allows outbound HTTPS (443)
+Ask ClawdBot in natural language:
+- "Check Kalshi exchange status"
+- "Show me active BTC Kalshi markets"
+- "What Kalshi signals does Yoshi have?"
+- "Is Kalshi API connected?"
+- "Show Kalshi market for KXBTC-25FEB06-T100000"
 
-### Restart the bot
+## Managing Services
 
 ```bash
+# View logs
+sudo journalctl -u clawdbot -f
+sudo journalctl -u yoshi-bridge -f
+
+# Restart
 sudo systemctl restart clawdbot
+sudo systemctl restart yoshi-bridge
+
+# Check status
+sudo systemctl status clawdbot
+sudo systemctl status yoshi-bridge
+
+# Check Yoshi Trading Core directly
+curl -s http://127.0.0.1:8000/status | python3 -m json.tool
+curl -s http://127.0.0.1:8000/positions | python3 -m json.tool
+```
+
+### Troubleshooting
+
+**Bot not responding:**
+1. Check if the service is running: `sudo systemctl status clawdbot`
+2. Check logs for errors: `sudo journalctl -u clawdbot -n 100`
+3. Verify your tokens are correct in `.env`
+
+**Connection issues:**
+1. Ensure port 18789 is open (for local gateway)
+2. Check DigitalOcean firewall allows outbound HTTPS (443)
+3. Restart: `sudo systemctl restart clawdbot`
+
+**Kalshi API errors:**
+1. Verify credentials: ask ClawdBot "Is Kalshi API connected?"
+2. Check Kalshi exchange status: may be outside trading hours
+3. Ensure `KALSHI_KEY_ID` and `KALSHI_PRIVATE_KEY` are set in Yoshi-Bot's `.env`
+
+## Project Structure
+
+```
+ClawdBot-V1/
+├── .env.example                    # Environment template
+├── package.json                    # Node.js project (moltbot dep)
+├── config/
+│   └── moltbot.example.json        # Moltbot gateway config
+├── skills/
+│   └── yoshi-trading/
+│       └── SKILL.md                # Yoshi-Trading bridge skill
+├── scripts/
+│   ├── deploy-bridge.sh            # Full bridge deployment (8 steps)
+│   ├── yoshi-bridge.py             # Scanner log -> Trading Core bridge
+│   ├── deploy.sh                   # Legacy VPS deployment
+│   ├── install.sh                  # One-line installer
+│   ├── setup-telegram.sh           # Telegram key setup
+│   └── clawdbot.service            # Systemd unit template
+└── moltbot-setup/
+    ├── SETUP-GUIDE.md              # DigitalOcean setup guide
+    └── install-moltbot.sh          # DO installer
 ```
 
 ## DigitalOcean Droplet Details
@@ -151,10 +312,15 @@ sudo systemctl restart clawdbot
 
 ## Security Notes
 
-- Never commit `.env` or files containing API keys
-- The `.env` file is gitignored by default
+- Never commit `.env` or files containing API keys or private keys
+- `.env`, `.pem`, and `.kalshi/` are all gitignored
+- The Trading Core API runs on localhost only (127.0.0.1:8000)
+- The moltbot gateway runs on localhost only (127.0.0.1:18789)
+- Kalshi private keys should be stored with `chmod 600` permissions
 - Use DigitalOcean Cloud Firewalls to restrict access
 - Consider enabling DigitalOcean Monitoring for observability
+- Trade approvals require explicit user confirmation via Telegram
+- Rotate Kalshi API keys immediately if exposed
 
 ## License
 
