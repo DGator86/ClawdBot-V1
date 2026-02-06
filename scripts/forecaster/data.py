@@ -6,14 +6,9 @@ to build a MarketSnapshot for the ensemble forecaster.
 
 Data source priority (US-compatible):
   1. Coinbase Exchange API  (OHLCV, orderbook, trades)
-  2. Binance.US API         (OHLCV, orderbook, trades)
-  3. Kraken API             (OHLCV, orderbook, trades)
-  4. CoinGecko API          (OHLCV fallback, prices)
-  5. Binance.com            (global, blocked in US — last resort)
-  6. Alternative.me         (Fear & Greed Index)
-
-Note: Binance.com returns HTTP 451 on US IPs. The fetcher
-automatically falls through to Coinbase/Kraken/CoinGecko.
+  2. Kraken API             (OHLCV, orderbook, trades)
+  3. CoinGecko API          (OHLCV fallback, prices)
+  4. Alternative.me         (Fear & Greed Index)
 
 All fetches use urllib (no extra dependencies) with timeouts.
 
@@ -35,9 +30,6 @@ from .schemas import Bar, MarketSnapshot
 
 # ── API endpoints ──────────────────────────────────────────
 COINBASE = "https://api.exchange.coinbase.com"
-BINANCE_US = "https://api.binance.us"
-BINANCE_SPOT = "https://api.binance.com"
-BINANCE_FUTURES = "https://fapi.binance.com"
 KRAKEN = "https://api.kraken.com/0/public"
 COINGECKO = "https://api.coingecko.com/api/v3"
 ALTERNATIVE_ME = "https://api.alternative.me/fng/"
@@ -53,7 +45,7 @@ KRAKEN_SYMBOLS = {
 }
 COINGECKO_IDS = {
     "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum",
-    "SOLUSDT": "solana", "BNBUSDT": "binancecoin",
+    "SOLUSDT": "solana",
 }
 
 HTTP_TIMEOUT = 12
@@ -72,9 +64,7 @@ def _get_json(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[dict | list]:
         })
         with request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
-    except urlerror.HTTPError as e:
-        if e.code == 451:
-            pass   # Binance geo-block — expected on US servers
+    except urlerror.HTTPError:
         return None
     except (urlerror.URLError, json.JSONDecodeError,
             OSError, TimeoutError, Exception):
@@ -182,77 +172,6 @@ def fetch_coinbase_trades(symbol: str, limit: int = 100) -> list[dict]:
             continue
     return trades
 
-
-# ═══════════════════════════════════════════════════════════════
-# BINANCE.US DATA FETCHERS (SECONDARY — works from US)
-# ═══════════════════════════════════════════════════════════════
-
-def fetch_binanceus_klines(symbol: str, interval: str = "1h",
-                            limit: int = 200) -> list[Bar]:
-    """Fetch OHLCV klines from Binance.US (US-accessible)."""
-    url = (f"{BINANCE_US}/api/v3/klines"
-           f"?symbol={symbol}&interval={interval}&limit={limit}")
-    data = _get_json(url)
-    if not data:
-        return []
-
-    bars = []
-    for k in data:
-        try:
-            bars.append(Bar(
-                timestamp=k[0] / 1000.0,
-                open=float(k[1]),
-                high=float(k[2]),
-                low=float(k[3]),
-                close=float(k[4]),
-                volume=float(k[5]),
-            ))
-        except (IndexError, ValueError, TypeError):
-            continue
-    return bars
-
-
-def fetch_binanceus_orderbook(symbol: str, limit: int = 20) -> dict:
-    """Fetch order book from Binance.US."""
-    url = f"{BINANCE_US}/api/v3/depth?symbol={symbol}&limit={limit}"
-    data = _get_json(url)
-    if not data:
-        return {}
-    try:
-        bids = data.get("bids", [])
-        asks = data.get("asks", [])
-        best_bid = float(bids[0][0]) if bids else 0
-        best_ask = float(asks[0][0]) if asks else 0
-        bid_depth = sum(float(b[1]) for b in bids[:limit])
-        ask_depth = sum(float(a[1]) for a in asks[:limit])
-        spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
-        return {
-            "best_bid": best_bid, "best_ask": best_ask,
-            "bid_depth": bid_depth, "ask_depth": ask_depth,
-            "spread": spread, "source": "binance_us",
-        }
-    except (IndexError, ValueError, TypeError):
-        return {}
-
-
-def fetch_binanceus_trades(symbol: str, limit: int = 100) -> list[dict]:
-    """Fetch recent trades from Binance.US."""
-    url = f"{BINANCE_US}/api/v3/trades?symbol={symbol}&limit={limit}"
-    data = _get_json(url)
-    if not data:
-        return []
-    trades = []
-    for t in data:
-        try:
-            trades.append({
-                "price": float(t["price"]),
-                "qty": float(t["qty"]),
-                "side": "sell" if t.get("isBuyerMaker", False) else "buy",
-                "time": t.get("time", 0) / 1000.0,
-            })
-        except (KeyError, ValueError, TypeError):
-            continue
-    return trades
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -404,67 +323,20 @@ def fetch_coingecko_ohlc(symbol: str, days: int = 7) -> list[Bar]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# BINANCE.COM (GLOBAL — blocked in US, last fallback for OHLCV)
-# ═══════════════════════════════════════════════════════════════
-
-def fetch_binance_klines(symbol: str, interval: str = "1h",
-                          limit: int = 200) -> list[Bar]:
-    """Fetch OHLCV klines from Binance.com (blocked in US)."""
-    url = (f"{BINANCE_SPOT}/api/v3/klines"
-           f"?symbol={symbol}&interval={interval}&limit={limit}")
-    data = _get_json(url)
-    if not data:
-        return []
-
-    bars = []
-    for k in data:
-        try:
-            bars.append(Bar(
-                timestamp=k[0] / 1000.0,
-                open=float(k[1]),
-                high=float(k[2]),
-                low=float(k[3]),
-                close=float(k[4]),
-                volume=float(k[5]),
-            ))
-        except (IndexError, ValueError, TypeError):
-            continue
-    return bars
-
-
-# ═══════════════════════════════════════════════════════════════
 # DERIVATIVES DATA (best-effort from available sources)
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_funding_rate(symbol: str) -> tuple[Optional[float], list[float]]:
-    """Try Binance futures (may be blocked), then Kraken."""
-    # Try Binance futures
-    url = (f"{BINANCE_FUTURES}/fapi/v1/fundingRate"
-           f"?symbol={symbol}&limit=30")
-    data = _get_json(url, timeout=5)
-    if data and isinstance(data, list):
-        rates = []
-        for item in data:
-            try:
-                rates.append(float(item["fundingRate"]))
-            except (KeyError, ValueError):
-                continue
-        if rates:
-            return rates[-1], rates
-
-    # Kraken doesn't expose funding easily via REST — return None
+    """Fetch funding rate data. Currently no US-accessible REST source."""
+    # No reliable US-accessible REST endpoint for funding rates.
+    # Future: integrate CoinGlass API or websocket feeds.
     return None, []
 
 
 def fetch_open_interest(symbol: str) -> Optional[float]:
-    """Try Binance futures for OI."""
-    url = f"{BINANCE_FUTURES}/fapi/v1/openInterest?symbol={symbol}"
-    data = _get_json(url, timeout=5)
-    if data and "openInterest" in data:
-        try:
-            return float(data["openInterest"])
-        except (ValueError, TypeError):
-            pass
+    """Fetch open interest data. Currently no US-accessible REST source."""
+    # No reliable US-accessible REST endpoint for OI.
+    # Future: integrate CoinGlass API or websocket feeds.
     return None
 
 
@@ -545,10 +417,8 @@ def fetch_ohlcv_bars(symbol: str, limit: int = 200) -> tuple[list[Bar], str]:
     """
     Fetch hourly OHLCV bars using fallback chain:
     1. Coinbase  (US-native, reliable)
-    2. Binance.US (US-accessible)
-    3. Kraken    (US-accessible)
-    4. CoinGecko (limited, no volume, 4h candles for 7d)
-    5. Binance.com (global, blocked in US)
+    2. Kraken    (US-accessible)
+    3. CoinGecko (limited, no volume, 4h candles for 7d)
 
     Returns (bars, source_name).
     """
@@ -557,25 +427,15 @@ def fetch_ohlcv_bars(symbol: str, limit: int = 200) -> tuple[list[Bar], str]:
     if len(bars) >= 20:
         return bars, "coinbase"
 
-    # 2) Binance.US
-    bars = fetch_binanceus_klines(symbol, "1h", limit)
-    if len(bars) >= 20:
-        return bars, "binance_us"
-
-    # 3) Kraken
+    # 2) Kraken
     bars = fetch_kraken_klines(symbol, interval=60, limit=limit)
     if len(bars) >= 20:
         return bars, "kraken"
 
-    # 4) CoinGecko OHLC (4h candles for 7 days ≈ 42 bars)
+    # 3) CoinGecko OHLC (4h candles for 7 days ≈ 42 bars)
     bars = fetch_coingecko_ohlc(symbol, days=30)
     if len(bars) >= 10:
         return bars, "coingecko"
-
-    # 5) Binance.com (last resort)
-    bars = fetch_binance_klines(symbol, "1h", limit)
-    if bars:
-        return bars, "binance_global"
 
     return [], "none"
 
@@ -583,10 +443,6 @@ def fetch_ohlcv_bars(symbol: str, limit: int = 200) -> tuple[list[Bar], str]:
 def fetch_orderbook(symbol: str) -> dict:
     """Fetch order book using fallback chain."""
     book = fetch_coinbase_orderbook(symbol)
-    if book:
-        return book
-
-    book = fetch_binanceus_orderbook(symbol)
     if book:
         return book
 
@@ -603,10 +459,6 @@ def fetch_recent_trades(symbol: str, limit: int = 200) -> tuple[list[dict], str]
     if trades:
         return trades, "coinbase"
 
-    trades = fetch_binanceus_trades(symbol, limit)
-    if trades:
-        return trades, "binance_us"
-
     trades = fetch_kraken_trades(symbol)
     if trades:
         return trades, "kraken"
@@ -622,7 +474,7 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT",
                            bars_limit: int = 200) -> MarketSnapshot:
     """
     Build a complete MarketSnapshot from all available data sources.
-    Uses multi-source fallback: Coinbase -> Binance.US -> Kraken -> CoinGecko.
+    Uses multi-source fallback: Coinbase -> Kraken -> CoinGecko.
     Gracefully handles missing data -- each module checks for None fields.
     """
     snap = MarketSnapshot(symbol=symbol, timestamp=time.time())
@@ -664,14 +516,14 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT",
             ))
         snap.bars_1d = bars_1d
 
-    # ── Derivatives data (Binance futures — may be geo-blocked) ──
+    # ── Derivatives data (best-effort) ──
     _log("Fetching derivatives data...")
     fr, fr_hist = fetch_funding_rate(symbol)
     snap.funding_rate = fr
     snap.funding_rate_history = fr_hist
     snap.open_interest = fetch_open_interest(symbol)
     deriv_items = sum(1 for x in [fr, snap.open_interest] if x is not None)
-    _log(f"  -> {deriv_items}/2 items" + (" (futures may be geo-blocked)" if deriv_items == 0 else ""))
+    _log(f"  -> {deriv_items}/2 items" + (" (no US-accessible source)" if deriv_items == 0 else ""))
 
     # ── Order book (with fallback chain) ──────────────────
     _log("Fetching order book...")

@@ -479,7 +479,7 @@ def print_eval_report(metrics: EvalMetrics, n_records: int = 0):
 
 def main():
     """
-    Run walk-forward evaluation on historical Binance data.
+    Run walk-forward evaluation on historical market data.
     Fetches bars and runs the full evaluation pipeline.
     """
     import argparse
@@ -497,11 +497,11 @@ def main():
     parser.add_argument("--output", "-o", type=str, default=None)
     args = parser.parse_args()
 
-    from .data import fetch_binance_klines
+    from .data import fetch_ohlcv_bars
 
     print(f"Fetching {args.bars} bars of {args.symbol} data...")
-    bars = fetch_binance_klines(args.symbol, "1h", args.bars)
-    print(f"Got {len(bars)} bars")
+    bars, source = fetch_ohlcv_bars(args.symbol, args.bars)
+    print(f"Got {len(bars)} bars from {source}")
 
     if len(bars) < 200:
         print("Not enough data for meaningful evaluation. Need 200+ bars.")

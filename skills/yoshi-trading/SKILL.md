@@ -46,7 +46,7 @@ When the user asks you to suggest or propose a trade, or when you identify an op
 ```bash
 curl -s -X POST http://127.0.0.1:8000/propose \
   -H "Content-Type: application/json" \
-  -d '{"exchange":"binance","symbol":"BTCUSDT","side":"buy","type":"market","amount":0.01}'
+  -d '{"exchange":"kalshi","symbol":"BTCUSDT","side":"buy","type":"market","amount":0.01}'
 ```
 
 **IMPORTANT**: Always explain why you're proposing the trade. Reference Yoshi's signal data, the current regime, edge percentage, and risk limits. Never propose a trade that would exceed the risk limits shown in `/status`.
