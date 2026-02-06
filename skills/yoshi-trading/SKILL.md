@@ -46,7 +46,7 @@ When the user asks you to suggest or propose a trade, or when you identify an op
 ```bash
 curl -s -X POST http://127.0.0.1:8000/propose \
   -H "Content-Type: application/json" \
-  -d '{"exchange":"binance","symbol":"BTCUSDT","side":"buy","type":"market","amount":0.01}'
+  -d '{"exchange":"kalshi","symbol":"BTCUSDT","side":"buy","type":"market","amount":0.01}'
 ```
 
 **IMPORTANT**: Always explain why you're proposing the trade. Reference Yoshi's signal data, the current regime, edge percentage, and risk limits. Never propose a trade that would exceed the risk limits shown in `/status`.
@@ -268,6 +268,118 @@ print(f'\nTotal active BTC markets: {len(markets)}')
 ```
 
 For ETH markets, change `series_ticker='KXBTC'` to `series_ticker='KXETH'`.
+
+---
+
+## 12-Paradigm Ensemble Forecaster
+
+The ensemble forecaster combines 12 forecasting paradigms with regime gating to produce comprehensive crypto price predictions. It replaces simple price-distance estimates with distribution forecasts, regime detection, and tail risk metrics.
+
+### Run a Full Ensemble Forecast
+
+When the user asks "what's your forecast?", "predict BTC", "run the ensemble", "12-paradigm forecast":
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.engine --symbol BTCUSDT --horizon 24 --barrier 65000
+```
+
+Options:
+- `--symbol BTCUSDT` or `ETHUSDT` or `SOLUSDT`
+- `--horizon 24` (hours, default 24)
+- `--barrier 65000` (optional, Kalshi barrier strike for probability calc)
+- `--mc-iterations 100000` (Monte Carlo iterations, default 50000)
+- `--no-mc` (skip Monte Carlo for faster results)
+- `--json` (output as JSON)
+- `--output /tmp/forecast.json` (save to file)
+
+The forecast includes:
+- **Direction + confidence** (Up/Down/Flat with probability)
+- **Price distribution** (Q05 through Q95)
+- **Regime** (trend_up, range, cascade_risk, etc.) with probabilities
+- **Risk metrics** (VaR, CVaR, jump/crash probabilities)
+- **Barrier probability** (for Kalshi contracts)
+- **Per-module breakdown** showing which paradigms agree/disagree
+
+### Run a Quick Forecast (no MC)
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.engine --symbol BTCUSDT --no-mc
+```
+
+### Get Barrier Probability for Kalshi
+
+```bash
+cd /root/ClawdBot-V1 && python3 -c "
+import sys; sys.path.insert(0, '.')
+from scripts.forecaster.engine import Forecaster
+fc = Forecaster(mc_iterations=50000)
+r = fc.forecast('BTCUSDT', horizon_hours=24, barrier_strike=65000)
+print(f'P(BTC >= \$65000): {r.barrier_above_prob:.1%}')
+print(f'Regime: {r.regime}')
+print(f'Predicted: \${r.predicted_price:,.2f}')
+print(f'Volatility: {r.volatility:.4f}')
+print(f'Jump risk: {r.jump_prob:.1%}')
+"
+```
+
+### Fetch Live Market Data Snapshot
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.data --symbol BTCUSDT
+```
+
+### Run Walk-Forward Backtest (Full Pipeline)
+
+When the user asks about performance, backtest, or evaluation. **Default runs the full 12/12 pipeline with Monte Carlo enabled** -- same code path as production:
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation --symbol BTCUSDT --bars 1000 --max-forecasts 30
+```
+
+Options:
+- `--enable-mc` (default: ON) — runs full 12-module pipeline with MC
+- `--no-mc` — disables Monte Carlo for faster but partial evaluation
+- `--mc-iterations 20000` — MC iterations per forecast step (default 20k)
+- `--barrier 65000` — fixed Kalshi barrier strike (auto-derived from price if omitted)
+- `--step 24` — bars between forecasts (default 24 = one per day)
+- `--horizon 24` — forecast horizon in hours
+
+Full-pipeline backtest with custom MC:
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation -s BTCUSDT --bars 1000 --max-forecasts 50 --mc-iterations 50000 --barrier 70000
+```
+
+Fast partial backtest (MC off, 10/12 modules):
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation -s BTCUSDT --bars 1000 --no-mc
+```
+
+The full-pipeline report includes:
+- **Direction**: hit rate, MCC
+- **Distribution**: pinball loss, CRPS
+- **Tail risk**: Brier scores for jumps/crashes
+- **Monte Carlo**: VaR calibration (breach rates vs targets), CVaR accuracy, P5-P95 envelope coverage, MC price MAE
+- **Barrier/Kalshi**: barrier Brier score, barrier hit rate, barrier calibration bins
+- **Per-regime**: metrics broken down by detected regime (trend_up, cascade_risk, etc.) with per-regime VaR and barrier accuracy
+- **Per-volatility-bucket**: low/normal/high/extreme vol performance
+
+### The 12 Paradigms
+
+The ensemble combines:
+1. **Technical features** — trend, mean-reversion, volatility regime, volume
+2. **Classical stats** — EWMA vol (GARCH-like), Kalman trend, regime switching
+3. **Macro factors** — cross-asset betas (SPX, DXY, Gold), crypto residual
+4. **Derivatives** — Leverage Fragility Index (LFI), funding, OI, tail risk
+5. **Microstructure** — order flow imbalance, trade imbalance, liquidity
+6. **On-chain** — MVRV, exchange flows (slow cycle priors)
+7. **Sentiment** — Fear & Greed, social volume (contrarian extremes)
+8. **Meta-learner** — confidence-weighted combination of all modules
+9. **Sequence model** — quantile regression on recent price sequences
+10. **Regime detector** — classifies market state and sets gating weights
+11. **Monte Carlo** — regime-conditioned jump-diffusion simulation
+12. **Crowd priors** — Kalshi implied probabilities as sanity checks
+
+**Edge Scanner Integration**: The ensemble automatically provides model_prob to the Kalshi edge scanner when available, replacing the simple logistic estimate with a distribution-based barrier probability.
 
 ---
 

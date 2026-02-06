@@ -85,7 +85,7 @@ def propose_trade(signal: dict) -> dict:
     side = "buy" if edge > 0 else "sell"
 
     payload = {
-        "exchange": "binance",
+        "exchange": "kalshi",
         "symbol": symbol,
         "side": side,
         "type": "market",
