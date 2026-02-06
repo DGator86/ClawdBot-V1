@@ -4,10 +4,16 @@ Market Data Fetcher -- Live Data for Forecaster Modules
 Fetches OHLCV, derivatives, and macro data from public APIs
 to build a MarketSnapshot for the ensemble forecaster.
 
-Data sources:
-  - Binance spot/futures API (OHLCV, funding, OI, trades)
-  - CoinGecko (fallback prices, fear & greed)
-  - Alternative.me (Fear & Greed Index)
+Data source priority (US-compatible):
+  1. Coinbase Exchange API  (OHLCV, orderbook, trades)
+  2. Binance.US API         (OHLCV, orderbook, trades)
+  3. Kraken API             (OHLCV, orderbook, trades)
+  4. CoinGecko API          (OHLCV fallback, prices)
+  5. Binance.com            (global, blocked in US — last resort)
+  6. Alternative.me         (Fear & Greed Index)
+
+Note: Binance.com returns HTTP 451 on US IPs. The fetcher
+automatically falls through to Coinbase/Kraken/CoinGecko.
 
 All fetches use urllib (no extra dependencies) with timeouts.
 
@@ -28,21 +34,29 @@ from urllib import request, error as urlerror
 from .schemas import Bar, MarketSnapshot
 
 # ── API endpoints ──────────────────────────────────────────
+COINBASE = "https://api.exchange.coinbase.com"
+BINANCE_US = "https://api.binance.us"
 BINANCE_SPOT = "https://api.binance.com"
 BINANCE_FUTURES = "https://fapi.binance.com"
+KRAKEN = "https://api.kraken.com/0/public"
 COINGECKO = "https://api.coingecko.com/api/v3"
 ALTERNATIVE_ME = "https://api.alternative.me/fng/"
 
-# Symbol mappings
+# Symbol mappings per exchange
+COINBASE_SYMBOLS = {
+    "BTCUSDT": "BTC-USD", "ETHUSDT": "ETH-USD",
+    "SOLUSDT": "SOL-USD", "BNBUSDT": None,
+}
+KRAKEN_SYMBOLS = {
+    "BTCUSDT": "XBTUSD", "ETHUSDT": "ETHUSD",
+    "SOLUSDT": "SOLUSD", "BNBUSDT": None,
+}
 COINGECKO_IDS = {
-    "BTCUSDT": "bitcoin",
-    "ETHUSDT": "ethereum",
-    "SOLUSDT": "solana",
-    "BNBUSDT": "binancecoin",
+    "BTCUSDT": "bitcoin", "ETHUSDT": "ethereum",
+    "SOLUSDT": "solana", "BNBUSDT": "binancecoin",
 }
 
-# Timeout for HTTP requests (seconds)
-HTTP_TIMEOUT = 10
+HTTP_TIMEOUT = 12
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -58,26 +72,125 @@ def _get_json(url: str, timeout: int = HTTP_TIMEOUT) -> Optional[dict | list]:
         })
         with request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode())
-    except (urlerror.URLError, urlerror.HTTPError, json.JSONDecodeError,
-            OSError, TimeoutError) as e:
-        # Silently fail -- data modules handle missing fields gracefully
+    except urlerror.HTTPError as e:
+        if e.code == 451:
+            pass   # Binance geo-block — expected on US servers
+        return None
+    except (urlerror.URLError, json.JSONDecodeError,
+            OSError, TimeoutError, Exception):
         return None
 
 
-def _get_trading_core(endpoint: str) -> Optional[dict]:
-    """Try to fetch from the local Trading Core API."""
-    url = os.getenv("TRADING_CORE_URL", "http://127.0.0.1:8000")
-    return _get_json(f"{url}{endpoint}", timeout=3)
+def _log(msg: str):
+    """Internal debug logging."""
+    print(f"  {msg}", flush=True)
 
 
 # ═══════════════════════════════════════════════════════════════
-# BINANCE DATA FETCHERS
+# COINBASE DATA FETCHERS (PRIMARY — works from US)
 # ═══════════════════════════════════════════════════════════════
 
-def fetch_binance_klines(symbol: str, interval: str = "1h",
-                          limit: int = 200) -> list[Bar]:
-    """Fetch OHLCV klines from Binance spot."""
-    url = (f"{BINANCE_SPOT}/api/v3/klines"
+def fetch_coinbase_klines(symbol: str, granularity: int = 3600,
+                           limit: int = 200) -> list[Bar]:
+    """
+    Fetch OHLCV candles from Coinbase Exchange.
+    granularity: seconds per candle (3600=1h, 14400=4h, 86400=1d)
+    Coinbase returns max 300 candles per request.
+    """
+    cb_symbol = COINBASE_SYMBOLS.get(symbol)
+    if not cb_symbol:
+        return []
+
+    url = (f"{COINBASE}/products/{cb_symbol}/candles"
+           f"?granularity={granularity}")
+    data = _get_json(url)
+    if not data or not isinstance(data, list):
+        return []
+
+    bars = []
+    for candle in data:
+        try:
+            # Coinbase format: [time, low, high, open, close, volume]
+            bars.append(Bar(
+                timestamp=float(candle[0]),
+                open=float(candle[3]),
+                high=float(candle[2]),
+                low=float(candle[1]),
+                close=float(candle[4]),
+                volume=float(candle[5]),
+            ))
+        except (IndexError, ValueError, TypeError):
+            continue
+
+    # Coinbase returns newest first — reverse to chronological
+    bars.sort(key=lambda b: b.timestamp)
+    # Trim to requested limit
+    if len(bars) > limit:
+        bars = bars[-limit:]
+    return bars
+
+
+def fetch_coinbase_orderbook(symbol: str, level: int = 2) -> dict:
+    """Fetch order book from Coinbase Exchange."""
+    cb_symbol = COINBASE_SYMBOLS.get(symbol)
+    if not cb_symbol:
+        return {}
+
+    url = f"{COINBASE}/products/{cb_symbol}/book?level={level}"
+    data = _get_json(url)
+    if not data:
+        return {}
+
+    try:
+        bids = data.get("bids", [])
+        asks = data.get("asks", [])
+        best_bid = float(bids[0][0]) if bids else 0
+        best_ask = float(asks[0][0]) if asks else 0
+        bid_depth = sum(float(b[1]) for b in bids[:20])
+        ask_depth = sum(float(a[1]) for a in asks[:20])
+        spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
+        return {
+            "best_bid": best_bid, "best_ask": best_ask,
+            "bid_depth": bid_depth, "ask_depth": ask_depth,
+            "spread": spread, "source": "coinbase",
+        }
+    except (IndexError, ValueError, TypeError):
+        return {}
+
+
+def fetch_coinbase_trades(symbol: str, limit: int = 100) -> list[dict]:
+    """Fetch recent trades from Coinbase."""
+    cb_symbol = COINBASE_SYMBOLS.get(symbol)
+    if not cb_symbol:
+        return []
+
+    url = f"{COINBASE}/products/{cb_symbol}/trades?limit={limit}"
+    data = _get_json(url)
+    if not data:
+        return []
+
+    trades = []
+    for t in data:
+        try:
+            trades.append({
+                "price": float(t["price"]),
+                "qty": float(t["size"]),
+                "side": t.get("side", "buy"),
+                "time": 0,
+            })
+        except (KeyError, ValueError, TypeError):
+            continue
+    return trades
+
+
+# ═══════════════════════════════════════════════════════════════
+# BINANCE.US DATA FETCHERS (SECONDARY — works from US)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_binanceus_klines(symbol: str, interval: str = "1h",
+                            limit: int = 200) -> list[Bar]:
+    """Fetch OHLCV klines from Binance.US (US-accessible)."""
+    url = (f"{BINANCE_US}/api/v3/klines"
            f"?symbol={symbol}&interval={interval}&limit={limit}")
     data = _get_json(url)
     if not data:
@@ -87,7 +200,7 @@ def fetch_binance_klines(symbol: str, interval: str = "1h",
     for k in data:
         try:
             bars.append(Bar(
-                timestamp=k[0] / 1000.0,  # ms -> s
+                timestamp=k[0] / 1000.0,
                 open=float(k[1]),
                 high=float(k[2]),
                 low=float(k[3]),
@@ -99,105 +212,35 @@ def fetch_binance_klines(symbol: str, interval: str = "1h",
     return bars
 
 
-def fetch_binance_funding_rate(symbol: str, limit: int = 30) -> tuple[Optional[float], list[float]]:
-    """Fetch current and historical funding rates from Binance futures."""
-    url = (f"{BINANCE_FUTURES}/fapi/v1/fundingRate"
-           f"?symbol={symbol}&limit={limit}")
-    data = _get_json(url)
-    if not data:
-        return None, []
-
-    rates = []
-    for item in data:
-        try:
-            rates.append(float(item["fundingRate"]))
-        except (KeyError, ValueError):
-            continue
-
-    current = rates[-1] if rates else None
-    return current, rates
-
-
-def fetch_binance_open_interest(symbol: str) -> Optional[float]:
-    """Fetch current open interest from Binance futures."""
-    url = f"{BINANCE_FUTURES}/fapi/v1/openInterest?symbol={symbol}"
-    data = _get_json(url)
-    if data and "openInterest" in data:
-        try:
-            return float(data["openInterest"])
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def fetch_binance_oi_history(symbol: str, period: str = "1h",
-                               limit: int = 30) -> list[float]:
-    """Fetch OI history from Binance futures."""
-    url = (f"{BINANCE_FUTURES}/futures/data/openInterestHist"
-           f"?symbol={symbol}&period={period}&limit={limit}")
-    data = _get_json(url)
-    if not data:
-        return []
-    ois = []
-    for item in data:
-        try:
-            ois.append(float(item.get("sumOpenInterest", 0)))
-        except (ValueError, TypeError):
-            continue
-    return ois
-
-
-def fetch_binance_long_short_ratio(symbol: str) -> Optional[float]:
-    """Fetch long/short ratio from Binance futures."""
-    url = (f"{BINANCE_FUTURES}/futures/data/globalLongShortAccountRatio"
-           f"?symbol={symbol}&period=1h&limit=1")
-    data = _get_json(url)
-    if data and len(data) > 0:
-        try:
-            return float(data[-1].get("longShortRatio", 1.0))
-        except (ValueError, TypeError):
-            pass
-    return None
-
-
-def fetch_binance_orderbook(symbol: str, limit: int = 20) -> dict:
-    """Fetch order book depth and spread."""
-    url = f"{BINANCE_SPOT}/api/v3/depth?symbol={symbol}&limit={limit}"
+def fetch_binanceus_orderbook(symbol: str, limit: int = 20) -> dict:
+    """Fetch order book from Binance.US."""
+    url = f"{BINANCE_US}/api/v3/depth?symbol={symbol}&limit={limit}"
     data = _get_json(url)
     if not data:
         return {}
-
     try:
         bids = data.get("bids", [])
         asks = data.get("asks", [])
-
         best_bid = float(bids[0][0]) if bids else 0
         best_ask = float(asks[0][0]) if asks else 0
-
-        # Total depth within first N levels
         bid_depth = sum(float(b[1]) for b in bids[:limit])
         ask_depth = sum(float(a[1]) for a in asks[:limit])
-
         spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
-
         return {
-            "best_bid": best_bid,
-            "best_ask": best_ask,
-            "bid_depth": bid_depth,
-            "ask_depth": ask_depth,
-            "spread": spread,
+            "best_bid": best_bid, "best_ask": best_ask,
+            "bid_depth": bid_depth, "ask_depth": ask_depth,
+            "spread": spread, "source": "binance_us",
         }
     except (IndexError, ValueError, TypeError):
         return {}
 
 
-def fetch_binance_recent_trades(symbol: str, limit: int = 100) -> list[dict]:
-    """Fetch recent trades for microstructure analysis."""
-    url = f"{BINANCE_SPOT}/api/v3/trades?symbol={symbol}&limit={limit}"
+def fetch_binanceus_trades(symbol: str, limit: int = 100) -> list[dict]:
+    """Fetch recent trades from Binance.US."""
+    url = f"{BINANCE_US}/api/v3/trades?symbol={symbol}&limit={limit}"
     data = _get_json(url)
     if not data:
         return []
-
     trades = []
     for t in data:
         try:
@@ -213,7 +256,220 @@ def fetch_binance_recent_trades(symbol: str, limit: int = 100) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════
-# ALTERNATIVE DATA FETCHERS
+# KRAKEN DATA FETCHERS (TERTIARY — works from US)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_kraken_klines(symbol: str, interval: int = 60,
+                         limit: int = 200) -> list[Bar]:
+    """
+    Fetch OHLCV from Kraken. interval in minutes (60=1h).
+    Kraken returns up to 720 candles.
+    """
+    kr_pair = KRAKEN_SYMBOLS.get(symbol)
+    if not kr_pair:
+        return []
+
+    # Request data from (limit * interval_minutes * 60) seconds ago
+    since = int(time.time()) - limit * interval * 60
+    url = f"{KRAKEN}/OHLC?pair={kr_pair}&interval={interval}&since={since}"
+    data = _get_json(url)
+    if not data or data.get("error"):
+        return []
+
+    result = data.get("result", {})
+    # Kraken returns {pair_name: [...], "last": timestamp}
+    bars = []
+    for key, candles in result.items():
+        if key == "last":
+            continue
+        for c in candles:
+            try:
+                # Kraken: [time, open, high, low, close, vwap, volume, count]
+                bars.append(Bar(
+                    timestamp=float(c[0]),
+                    open=float(c[1]),
+                    high=float(c[2]),
+                    low=float(c[3]),
+                    close=float(c[4]),
+                    volume=float(c[6]),
+                ))
+            except (IndexError, ValueError, TypeError):
+                continue
+
+    bars.sort(key=lambda b: b.timestamp)
+    if len(bars) > limit:
+        bars = bars[-limit:]
+    return bars
+
+
+def fetch_kraken_orderbook(symbol: str, count: int = 20) -> dict:
+    """Fetch order book from Kraken."""
+    kr_pair = KRAKEN_SYMBOLS.get(symbol)
+    if not kr_pair:
+        return {}
+
+    url = f"{KRAKEN}/Depth?pair={kr_pair}&count={count}"
+    data = _get_json(url)
+    if not data or data.get("error"):
+        return {}
+
+    result = data.get("result", {})
+    for key, book in result.items():
+        if key == "last":
+            continue
+        try:
+            bids = book.get("bids", [])
+            asks = book.get("asks", [])
+            best_bid = float(bids[0][0]) if bids else 0
+            best_ask = float(asks[0][0]) if asks else 0
+            bid_depth = sum(float(b[1]) for b in bids[:count])
+            ask_depth = sum(float(a[1]) for a in asks[:count])
+            spread = (best_ask - best_bid) / best_bid if best_bid > 0 else 0
+            return {
+                "best_bid": best_bid, "best_ask": best_ask,
+                "bid_depth": bid_depth, "ask_depth": ask_depth,
+                "spread": spread, "source": "kraken",
+            }
+        except (IndexError, ValueError, TypeError):
+            continue
+    return {}
+
+
+def fetch_kraken_trades(symbol: str) -> list[dict]:
+    """Fetch recent trades from Kraken."""
+    kr_pair = KRAKEN_SYMBOLS.get(symbol)
+    if not kr_pair:
+        return []
+
+    url = f"{KRAKEN}/Trades?pair={kr_pair}&count=200"
+    data = _get_json(url)
+    if not data or data.get("error"):
+        return []
+
+    result = data.get("result", {})
+    trades = []
+    for key, trade_list in result.items():
+        if key == "last":
+            continue
+        for t in trade_list[-200:]:
+            try:
+                # Kraken: [price, volume, time, buy/sell, market/limit, misc, trade_id]
+                trades.append({
+                    "price": float(t[0]),
+                    "qty": float(t[1]),
+                    "side": "buy" if t[3] == "b" else "sell",
+                    "time": float(t[2]),
+                })
+            except (IndexError, ValueError, TypeError):
+                continue
+    return trades
+
+
+# ═══════════════════════════════════════════════════════════════
+# COINGECKO OHLCV FALLBACK
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_coingecko_ohlc(symbol: str, days: int = 7) -> list[Bar]:
+    """
+    Fetch OHLC from CoinGecko (limited granularity).
+    days=1: 30min candles, days=7-30: 4h candles, days=90+: daily.
+    No volume data. Last resort.
+    """
+    cg_id = COINGECKO_IDS.get(symbol)
+    if not cg_id:
+        return []
+
+    url = f"{COINGECKO}/coins/{cg_id}/ohlc?vs_currency=usd&days={days}"
+    data = _get_json(url)
+    if not data or not isinstance(data, list):
+        return []
+
+    bars = []
+    for candle in data:
+        try:
+            # CoinGecko OHLC: [timestamp_ms, open, high, low, close]
+            bars.append(Bar(
+                timestamp=candle[0] / 1000.0,
+                open=float(candle[1]),
+                high=float(candle[2]),
+                low=float(candle[3]),
+                close=float(candle[4]),
+                volume=0.0,  # CoinGecko OHLC doesn't include volume
+            ))
+        except (IndexError, ValueError, TypeError):
+            continue
+
+    bars.sort(key=lambda b: b.timestamp)
+    return bars
+
+
+# ═══════════════════════════════════════════════════════════════
+# BINANCE.COM (GLOBAL — blocked in US, last fallback for OHLCV)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_binance_klines(symbol: str, interval: str = "1h",
+                          limit: int = 200) -> list[Bar]:
+    """Fetch OHLCV klines from Binance.com (blocked in US)."""
+    url = (f"{BINANCE_SPOT}/api/v3/klines"
+           f"?symbol={symbol}&interval={interval}&limit={limit}")
+    data = _get_json(url)
+    if not data:
+        return []
+
+    bars = []
+    for k in data:
+        try:
+            bars.append(Bar(
+                timestamp=k[0] / 1000.0,
+                open=float(k[1]),
+                high=float(k[2]),
+                low=float(k[3]),
+                close=float(k[4]),
+                volume=float(k[5]),
+            ))
+        except (IndexError, ValueError, TypeError):
+            continue
+    return bars
+
+
+# ═══════════════════════════════════════════════════════════════
+# DERIVATIVES DATA (best-effort from available sources)
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_funding_rate(symbol: str) -> tuple[Optional[float], list[float]]:
+    """Try Binance futures (may be blocked), then Kraken."""
+    # Try Binance futures
+    url = (f"{BINANCE_FUTURES}/fapi/v1/fundingRate"
+           f"?symbol={symbol}&limit=30")
+    data = _get_json(url, timeout=5)
+    if data and isinstance(data, list):
+        rates = []
+        for item in data:
+            try:
+                rates.append(float(item["fundingRate"]))
+            except (KeyError, ValueError):
+                continue
+        if rates:
+            return rates[-1], rates
+
+    # Kraken doesn't expose funding easily via REST — return None
+    return None, []
+
+
+def fetch_open_interest(symbol: str) -> Optional[float]:
+    """Try Binance futures for OI."""
+    url = f"{BINANCE_FUTURES}/fapi/v1/openInterest?symbol={symbol}"
+    data = _get_json(url, timeout=5)
+    if data and "openInterest" in data:
+        try:
+            return float(data["openInterest"])
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════
+# ALTERNATIVE DATA
 # ═══════════════════════════════════════════════════════════════
 
 def fetch_fear_greed() -> Optional[float]:
@@ -228,7 +484,7 @@ def fetch_fear_greed() -> Optional[float]:
 
 
 def fetch_coingecko_price(symbol: str) -> Optional[float]:
-    """Fallback price fetch from CoinGecko."""
+    """Fetch price from CoinGecko."""
     cg_id = COINGECKO_IDS.get(symbol)
     if not cg_id:
         return None
@@ -243,37 +499,21 @@ def fetch_coingecko_price(symbol: str) -> Optional[float]:
 
 
 def fetch_macro_proxies() -> dict:
-    """
-    Fetch cross-asset proxies for macro factor module.
-    Uses CoinGecko market data where available.
-    Returns dict with spx_return_1d, dxy_return_1d, etc.
-    """
-    # ETH/BTC ratio from CoinGecko
+    """Fetch cross-asset proxies for macro factor module."""
     result = {}
     data = _get_json(
-        f"{COINGECKO}/simple/price"
-        f"?ids=ethereum&vs_currencies=btc"
+        f"{COINGECKO}/simple/price?ids=ethereum&vs_currencies=btc"
     )
     if data and "ethereum" in data:
         try:
             result["eth_btc_ratio"] = float(data["ethereum"]["btc"])
         except (KeyError, ValueError):
             pass
-
-    # For SPX/DXY/Gold, we'd need a paid API or proxy.
-    # Leave as None and the macro module handles gracefully.
     return result
 
 
-# ═══════════════════════════════════════════════════════════════
-# KALSHI DATA (from existing scanner state)
-# ═══════════════════════════════════════════════════════════════
-
 def fetch_kalshi_priors(symbol: str) -> dict:
-    """
-    Read Kalshi barrier probabilities from top_picks.json
-    (written by kalshi-edge-scanner.py).
-    """
+    """Read Kalshi barrier probabilities from top_picks.json."""
     priors = {}
     state_paths = [
         os.path.join(os.path.dirname(__file__), "..", "..", "data", "top_picks.json"),
@@ -298,6 +538,83 @@ def fetch_kalshi_priors(symbol: str) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════
+# MULTI-SOURCE OHLCV FETCHER WITH FALLBACK CHAIN
+# ═══════════════════════════════════════════════════════════════
+
+def fetch_ohlcv_bars(symbol: str, limit: int = 200) -> tuple[list[Bar], str]:
+    """
+    Fetch hourly OHLCV bars using fallback chain:
+    1. Coinbase  (US-native, reliable)
+    2. Binance.US (US-accessible)
+    3. Kraken    (US-accessible)
+    4. CoinGecko (limited, no volume, 4h candles for 7d)
+    5. Binance.com (global, blocked in US)
+
+    Returns (bars, source_name).
+    """
+    # 1) Coinbase
+    bars = fetch_coinbase_klines(symbol, granularity=3600, limit=limit)
+    if len(bars) >= 20:
+        return bars, "coinbase"
+
+    # 2) Binance.US
+    bars = fetch_binanceus_klines(symbol, "1h", limit)
+    if len(bars) >= 20:
+        return bars, "binance_us"
+
+    # 3) Kraken
+    bars = fetch_kraken_klines(symbol, interval=60, limit=limit)
+    if len(bars) >= 20:
+        return bars, "kraken"
+
+    # 4) CoinGecko OHLC (4h candles for 7 days ≈ 42 bars)
+    bars = fetch_coingecko_ohlc(symbol, days=30)
+    if len(bars) >= 10:
+        return bars, "coingecko"
+
+    # 5) Binance.com (last resort)
+    bars = fetch_binance_klines(symbol, "1h", limit)
+    if bars:
+        return bars, "binance_global"
+
+    return [], "none"
+
+
+def fetch_orderbook(symbol: str) -> dict:
+    """Fetch order book using fallback chain."""
+    book = fetch_coinbase_orderbook(symbol)
+    if book:
+        return book
+
+    book = fetch_binanceus_orderbook(symbol)
+    if book:
+        return book
+
+    book = fetch_kraken_orderbook(symbol)
+    if book:
+        return book
+
+    return {}
+
+
+def fetch_recent_trades(symbol: str, limit: int = 200) -> tuple[list[dict], str]:
+    """Fetch recent trades using fallback chain."""
+    trades = fetch_coinbase_trades(symbol, limit)
+    if trades:
+        return trades, "coinbase"
+
+    trades = fetch_binanceus_trades(symbol, limit)
+    if trades:
+        return trades, "binance_us"
+
+    trades = fetch_kraken_trades(symbol)
+    if trades:
+        return trades, "kraken"
+
+    return [], "none"
+
+
+# ═══════════════════════════════════════════════════════════════
 # MAIN SNAPSHOT BUILDER
 # ═══════════════════════════════════════════════════════════════
 
@@ -305,24 +622,21 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT",
                            bars_limit: int = 200) -> MarketSnapshot:
     """
     Build a complete MarketSnapshot from all available data sources.
+    Uses multi-source fallback: Coinbase -> Binance.US -> Kraken -> CoinGecko.
     Gracefully handles missing data -- each module checks for None fields.
-
-    Args:
-        symbol: Trading pair symbol (e.g., "BTCUSDT")
-        bars_limit: Number of hourly bars to fetch
-
-    Returns:
-        MarketSnapshot with all available data populated.
     """
     snap = MarketSnapshot(symbol=symbol, timestamp=time.time())
 
-    # ── OHLCV bars ────────────────────────────────────────
-    print(f"  Fetching {symbol} 1h bars...", end=" ", flush=True)
-    snap.bars_1h = fetch_binance_klines(symbol, "1h", bars_limit)
-    print(f"{len(snap.bars_1h)} bars")
+    # ── OHLCV bars (with fallback chain) ──────────────────
+    _log(f"Fetching {symbol} 1h bars...")
+    snap.bars_1h, ohlcv_source = fetch_ohlcv_bars(symbol, bars_limit)
+    _log(f"  -> {len(snap.bars_1h)} bars from {ohlcv_source}")
 
+    if not snap.bars_1h:
+        _log("WARNING: No OHLCV data from any source!")
+
+    # Build multi-timeframe bars by aggregation
     if len(snap.bars_1h) >= 24:
-        # Build 4h bars by aggregation
         bars_4h = []
         for i in range(0, len(snap.bars_1h) - 3, 4):
             chunk = snap.bars_1h[i:i+4]
@@ -337,7 +651,6 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT",
         snap.bars_4h = bars_4h
 
     if len(snap.bars_1h) >= 48:
-        # Build daily bars
         bars_1d = []
         for i in range(0, len(snap.bars_1h) - 23, 24):
             chunk = snap.bars_1h[i:i+24]
@@ -351,55 +664,54 @@ def fetch_market_snapshot(symbol: str = "BTCUSDT",
             ))
         snap.bars_1d = bars_1d
 
-    # ── Derivatives data ──────────────────────────────────
-    print(f"  Fetching derivatives data...", end=" ", flush=True)
-    fr, fr_hist = fetch_binance_funding_rate(symbol)
+    # ── Derivatives data (Binance futures — may be geo-blocked) ──
+    _log("Fetching derivatives data...")
+    fr, fr_hist = fetch_funding_rate(symbol)
     snap.funding_rate = fr
     snap.funding_rate_history = fr_hist
+    snap.open_interest = fetch_open_interest(symbol)
+    deriv_items = sum(1 for x in [fr, snap.open_interest] if x is not None)
+    _log(f"  -> {deriv_items}/2 items" + (" (futures may be geo-blocked)" if deriv_items == 0 else ""))
 
-    snap.open_interest = fetch_binance_open_interest(symbol)
-    snap.oi_history = fetch_binance_oi_history(symbol)
-    snap.long_short_ratio = fetch_binance_long_short_ratio(symbol)
-    deriv_items = sum(1 for x in [fr, snap.open_interest, snap.long_short_ratio] if x is not None)
-    print(f"{deriv_items}/3 items")
-
-    # ── Order book / microstructure ───────────────────────
-    print(f"  Fetching order book...", end=" ", flush=True)
-    book = fetch_binance_orderbook(symbol)
+    # ── Order book (with fallback chain) ──────────────────
+    _log("Fetching order book...")
+    book = fetch_orderbook(symbol)
     if book:
         snap.best_bid = book.get("best_bid")
         snap.best_ask = book.get("best_ask")
         snap.bid_depth = book.get("bid_depth")
         snap.ask_depth = book.get("ask_depth")
         snap.spread = book.get("spread")
-        print("OK")
+        _log(f"  -> OK from {book.get('source', '?')}")
     else:
-        print("unavailable")
+        _log("  -> unavailable")
 
-    print(f"  Fetching recent trades...", end=" ", flush=True)
-    snap.recent_trades = fetch_binance_recent_trades(symbol, limit=200)
-    print(f"{len(snap.recent_trades)} trades")
+    # ── Recent trades (with fallback chain) ────────────────
+    _log("Fetching recent trades...")
+    snap.recent_trades, trades_source = fetch_recent_trades(symbol, limit=200)
+    _log(f"  -> {len(snap.recent_trades)} trades from {trades_source}")
 
     # ── Macro proxies ─────────────────────────────────────
-    print(f"  Fetching macro proxies...", end=" ", flush=True)
+    _log("Fetching macro proxies...")
     macro = fetch_macro_proxies()
     snap.eth_btc_ratio = macro.get("eth_btc_ratio")
     snap.spx_return_1d = macro.get("spx_return_1d")
     snap.dxy_return_1d = macro.get("dxy_return_1d")
     snap.gold_return_1d = macro.get("gold_return_1d")
-    print(f"{len(macro)} items")
+    _log(f"  -> {len(macro)} items")
 
     # ── Sentiment ─────────────────────────────────────────
-    print(f"  Fetching sentiment...", end=" ", flush=True)
+    _log("Fetching sentiment...")
     snap.fear_greed_index = fetch_fear_greed()
-    print(f"FGI={snap.fear_greed_index}" if snap.fear_greed_index else "unavailable")
+    _log(f"  -> FGI={snap.fear_greed_index}" if snap.fear_greed_index else "  -> unavailable")
 
     # ── Kalshi priors ─────────────────────────────────────
     snap.kalshi_barrier_probs = fetch_kalshi_priors(symbol)
     if snap.kalshi_barrier_probs:
-        print(f"  Kalshi priors: {len(snap.kalshi_barrier_probs)} strikes")
+        _log(f"Kalshi priors: {len(snap.kalshi_barrier_probs)} strikes")
 
-    print(f"  Snapshot ready: {symbol} @ ${snap.current_price:,.2f}")
+    _log(f"Snapshot ready: {symbol} @ ${snap.current_price:,.2f} "
+         f"({len(snap.bars_1h)} bars from {ohlcv_source})")
     return snap
 
 
@@ -426,13 +738,11 @@ if __name__ == "__main__":
     print(f"  1d bars:   {len(snap.bars_1d)}")
     print(f"  Funding:   {snap.funding_rate}")
     print(f"  OI:        {snap.open_interest}")
-    print(f"  L/S Ratio: {snap.long_short_ratio}")
     print(f"  Spread:    {snap.spread}")
     print(f"  FGI:       {snap.fear_greed_index}")
     print(f"{'='*50}")
 
     if args.output:
-        # Serialize snapshot
         out = {
             "symbol": snap.symbol,
             "timestamp": snap.timestamp,
@@ -440,7 +750,6 @@ if __name__ == "__main__":
             "n_bars_1h": len(snap.bars_1h),
             "funding_rate": snap.funding_rate,
             "open_interest": snap.open_interest,
-            "long_short_ratio": snap.long_short_ratio,
             "spread": snap.spread,
             "fear_greed_index": snap.fear_greed_index,
             "eth_btc_ratio": snap.eth_btc_ratio,
