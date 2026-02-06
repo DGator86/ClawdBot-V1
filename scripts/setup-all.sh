@@ -365,6 +365,8 @@ rm -rf /root/.moltbot 2>/dev/null  # remove old state dir that triggers doctor w
 
 # Generate gateway auth token
 GATEWAY_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
+# Remove any leftover legacy config to avoid migration noise
+rm -f ~/.clawdbot/moltbot.json 2>/dev/null
 
 cat > ~/.clawdbot/moltbot.json << MOLTEOF
 {
@@ -396,6 +398,7 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
       "mode": "token",
       "token": "$GATEWAY_TOKEN"
     }
+    "bind": "loopback"
   },
   "channels": {
     "telegram": {
@@ -414,6 +417,7 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
 MOLTEOF
 chmod 700 ~/.clawdbot
 ok "~/.clawdbot/moltbot.json (token: ${GATEWAY_TOKEN:0:8}...)"
+ok "~/.clawdbot/moltbot.json"
 
 # ================================================================
 # 8. Systemd services
@@ -430,6 +434,10 @@ MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/bin/moltbot")
 echo "  Validating moltbot config..."
 cd "$CLAWDBOT_DIR"
 "$MOLTBOT_BIN" doctor --non-interactive 2>&1 | grep -E "Telegram:|Error:|Gateway" | head -5
+# Run moltbot doctor --fix to auto-migrate any remaining issues
+echo "  Validating moltbot config..."
+cd "$CLAWDBOT_DIR"
+"$MOLTBOT_BIN" doctor --fix --non-interactive 2>&1 | tail -5
 ok "Config validated"
 
 cat > /etc/systemd/system/clawdbot.service << SVCEOF
@@ -506,6 +514,8 @@ ok "kalshi-edge-scanner.service"
 
 systemctl daemon-reload
 systemctl enable clawdbot yoshi-bridge kalshi-edge-scanner >/dev/null 2>&1
+systemctl daemon-reload
+systemctl enable clawdbot yoshi-bridge >/dev/null 2>&1
 ok "Enabled"
 
 # ================================================================
@@ -521,6 +531,7 @@ if $KALSHI_CONFIGURED; then
     systemctl restart kalshi-edge-scanner 2>/dev/null || true
 fi
 sleep 3
+sleep 4
 
 echo ""
 CS=$(systemctl is-active clawdbot 2>/dev/null || echo "dead")
@@ -548,6 +559,7 @@ if $KALSHI_CONFIGURED; then
 else
     warn "Kalshi: needs private key — edge scanner disabled"
 fi
+$KALSHI_CONFIGURED && ok "Kalshi: CONFIGURED" || warn "Kalshi: needs private key"
 
 # ================================================================
 header "DONE"
