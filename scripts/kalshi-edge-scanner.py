@@ -35,15 +35,15 @@ Env vars (from Yoshi-Bot .env):
 """
 
 import argparse
+import base64
 import json
 import math
 import os
 import sys
 import time
-import importlib.util
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib import request, error as urlerror
+from urllib import request, error as urlerror, parse as urlparse
 
 # ── Config ───────────────────────────────────────────────
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://127.0.0.1:8000")
@@ -74,41 +74,205 @@ def log(msg: str, level: str = "INFO"):
         pass
 
 
-# ── Kalshi Client (load from Yoshi-Bot or standalone) ────
-def load_kalshi_client():
-    """Try to load KalshiClient from Yoshi-Bot, fallback to bundled."""
-    # Try Yoshi-Bot locations
-    for yoshi_dir in ["/root/Yoshi-Bot", "/home/root/Yoshi-Bot"]:
-        client_path = os.path.join(yoshi_dir, "src", "gnosis", "utils", "kalshi_client.py")
-        env_path = os.path.join(yoshi_dir, ".env")
-        if os.path.isfile(client_path):
-            # Source the .env
-            if os.path.isfile(env_path):
-                _source_env(env_path)
-            # Direct import to avoid __init__.py chain
-            spec = importlib.util.spec_from_file_location("kalshi_client", client_path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            log(f"Loaded KalshiClient from {client_path}")
-            return mod.KalshiClient
-    raise ImportError("KalshiClient not found — is Yoshi-Bot installed?")
+# ── .env loader ──────────────────────────────────────────
+# Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
+_FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
 
 def _source_env(path: str):
-    """Read a .env file and set vars in os.environ."""
+    """Read a .env file and set vars in os.environ.
+    
+    KALSHI_PRIVATE_KEY is force-overwritten because systemd's
+    EnvironmentFile truncates multi-line values to one line.
+    """
     try:
         with open(path) as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
+            for raw in f:
+                raw = raw.strip()
+                if not raw or raw.startswith("#") or "=" not in raw:
                     continue
-                key, _, val = line.partition("=")
+                key, _, val = raw.partition("=")
                 key = key.strip()
-                val = val.strip().strip('"').strip("'")
+                val = val.strip()
+                # Handle multi-line PEM values wrapped in quotes
+                if val.startswith('"') and not val.endswith('"'):
+                    # Multi-line value — keep reading
+                    lines = [val[1:]]  # strip opening quote
+                    for extra in f:
+                        extra = extra.rstrip("\n")
+                        if extra.endswith('"'):
+                            lines.append(extra[:-1])
+                            break
+                        lines.append(extra)
+                    val = "\n".join(lines)
+                else:
+                    val = val.strip('"').strip("'")
                 if key and val:
-                    os.environ.setdefault(key, val)
+                    if key in _FORCE_OVERWRITE_KEYS:
+                        os.environ[key] = val  # overwrite systemd's truncated value
+                    else:
+                        os.environ.setdefault(key, val)
     except Exception:
         pass
+
+
+# ── Standalone Kalshi API Client ─────────────────────────
+class KalshiClient:
+    """
+    Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth.
+    No external dependencies beyond `cryptography` (system package).
+    
+    Reads KALSHI_KEY_ID and KALSHI_PRIVATE_KEY from environment.
+    """
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(self):
+        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
+        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+        if not self.key_id:
+            raise ValueError("KALSHI_KEY_ID not set")
+        if not pk_raw:
+            # Try loading from file
+            for pk_path in [
+                os.path.expanduser("~/.kalshi/private_key.pem"),
+                "/root/.kalshi/private_key.pem",
+            ]:
+                if os.path.isfile(pk_path):
+                    with open(pk_path) as f:
+                        pk_raw = f.read().strip()
+                    break
+        if not pk_raw:
+            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
+
+        # Fix PEM formatting — env vars often have literal \n instead of newlines
+        pk_raw = self._fix_pem(pk_raw)
+
+        # Load the RSA private key
+        try:
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
+        except ImportError:
+            raise ImportError(
+                "cryptography package not installed. Run: pip3 install cryptography"
+            )
+
+    @staticmethod
+    def _fix_pem(raw: str) -> str:
+        """
+        Normalize a PEM key that may have been mangled by env var storage.
+        Handles:
+          - literal \\n instead of real newlines
+          - single-line PEM with headers but no line breaks
+          - raw base64 with NO headers at all (spaces instead of newlines)
+          - raw base64 with no whitespace at all
+        """
+        import re
+
+        # Replace literal \n with real newlines
+        if "\\n" in raw:
+            raw = raw.replace("\\n", "\n")
+
+        # If it has PEM headers but is mangled onto one/two lines
+        if "-----BEGIN" in raw and raw.count("\n") <= 2:
+            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
+            if m:
+                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
+                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
+                if header_match and footer_match:
+                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
+                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
+            return raw.strip()
+
+        # NO PEM headers — raw base64 (possibly with spaces instead of newlines)
+        if "-----BEGIN" not in raw:
+            # Strip all whitespace to get clean base64
+            body = re.sub(r"\s+", "", raw)
+            # Validate it looks like base64
+            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
+                # Wrap at 64 chars and add RSA PRIVATE KEY headers
+                lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
+
+        return raw.strip()
+
+    def _sign(self, method: str, path: str, body: str = "") -> dict:
+        """Create authenticated headers for a Kalshi API request."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        timestamp = str(int(time.time() * 1000))
+        message = timestamp + method + path + body
+        signature = self.private_key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        }
+
+    def _request(self, method: str, path: str, body: str = ""):
+        """Make an authenticated HTTP request to Kalshi."""
+        headers = self._sign(method, path, body)
+        url = self.BASE_URL + path
+        data = body.encode() if body else None
+        req = request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            log(f"Kalshi API error ({method} {path}): {e}", "ERROR")
+            return None
+
+    def get_exchange_status(self) -> dict | None:
+        return self._request("GET", "/exchange/status")
+
+    def list_markets(self, limit: int = 200, **kwargs) -> list[dict]:
+        params = {"limit": str(limit)}
+        for k, v in kwargs.items():
+            params[k] = str(v)
+        qs = urlparse.urlencode(params)
+        result = self._request("GET", f"/markets?{qs}")
+        if result and "markets" in result:
+            return result["markets"]
+        return result if isinstance(result, list) else []
+
+    def get_market(self, ticker: str) -> dict | None:
+        return self._request("GET", f"/markets/{ticker}")
+
+
+def load_kalshi_client():
+    """Load env files and return the KalshiClient class."""
+    # Source all known .env files for credentials
+    for env_path in [
+        "/root/Yoshi-Bot/.env",
+        "/root/ClawdBot-V1/.env",
+        "/home/root/Yoshi-Bot/.env",
+        os.path.expanduser("~/.env"),
+    ]:
+        if os.path.isfile(env_path):
+            _source_env(env_path)
+            log(f"Loaded env from {env_path}")
+
+    # Verify we have credentials
+    if not os.environ.get("KALSHI_KEY_ID"):
+        raise ImportError("KALSHI_KEY_ID not found in any .env file")
+
+    # Test that we can create a client
+    try:
+        client = KalshiClient()
+        log(f"Kalshi client initialized (key: {client.key_id[:12]}...)")
+    except Exception as e:
+        raise ImportError(f"Cannot create Kalshi client: {e}")
+
+    return KalshiClient  # Return the class, not instance
 
 
 # ── Price fetching (lightweight, no ccxt dependency) ─────

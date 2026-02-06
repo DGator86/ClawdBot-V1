@@ -7,13 +7,14 @@ Designed to be called by ClawdBot after user approves a pick.
 
 Usage:
   python3 scripts/kalshi-order.py --ticker KXBTC-26FEB06-T64000 --side yes --count 5
-  python3 scripts/kalshi-order.py --ticker KXBTC-26FEB06-T64000 --side no --count 3 --limit 45
+  python3 scripts/kalshi-order.py --ticker KXBTC-26FEB06-T64000 --side no --count 3 --type limit --price 45
   python3 scripts/kalshi-order.py --cancel ORDER_ID
   python3 scripts/kalshi-order.py --positions    # show current positions
   python3 scripts/kalshi-order.py --orders       # show open orders
   python3 scripts/kalshi-order.py --balance      # show account balance
 
-Env vars: KALSHI_KEY_ID, KALSHI_PRIVATE_KEY (from Yoshi-Bot .env)
+Env vars: KALSHI_KEY_ID, KALSHI_PRIVATE_KEY
+Standalone — no Yoshi-Bot dependency. Requires: cryptography (pip3 install cryptography)
 """
 
 import argparse
@@ -22,84 +23,144 @@ import json
 import os
 import sys
 import time
-import importlib.util
-from pathlib import Path
+from urllib import request, parse as urlparse
+
+
+# Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
+_FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
 
 def load_env():
-    """Source Yoshi-Bot .env for Kalshi credentials."""
-    for env_path in ["/root/Yoshi-Bot/.env", "/home/root/Yoshi-Bot/.env"]:
+    """Source .env files for Kalshi credentials.
+    
+    KALSHI_PRIVATE_KEY is force-overwritten because systemd's
+    EnvironmentFile truncates multi-line values to one line.
+    """
+    for env_path in [
+        "/root/Yoshi-Bot/.env",
+        "/root/ClawdBot-V1/.env",
+        "/home/root/Yoshi-Bot/.env",
+        os.path.expanduser("~/.env"),
+    ]:
         if os.path.isfile(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#") or "=" not in line:
-                        continue
-                    key, _, val = line.partition("=")
-                    key = key.strip()
-                    val = val.strip().strip('"').strip("'")
-                    if key and val:
-                        os.environ.setdefault(key, val)
-            return True
-    return False
+            try:
+                with open(env_path) as f:
+                    for raw in f:
+                        raw = raw.strip()
+                        if not raw or raw.startswith("#") or "=" not in raw:
+                            continue
+                        key, _, val = raw.partition("=")
+                        key = key.strip()
+                        val = val.strip()
+                        # Handle multi-line PEM values
+                        if val.startswith('"') and not val.endswith('"'):
+                            lines = [val[1:]]
+                            for extra in f:
+                                extra = extra.rstrip("\n")
+                                if extra.endswith('"'):
+                                    lines.append(extra[:-1])
+                                    break
+                                lines.append(extra)
+                            val = "\n".join(lines)
+                        else:
+                            val = val.strip('"').strip("'")
+                        if key and val:
+                            if key in _FORCE_OVERWRITE_KEYS:
+                                os.environ[key] = val
+                            else:
+                                os.environ.setdefault(key, val)
+            except Exception:
+                pass
 
 
-def load_client():
-    """Load KalshiClient from Yoshi-Bot."""
-    for yoshi_dir in ["/root/Yoshi-Bot", "/home/root/Yoshi-Bot"]:
-        path = os.path.join(yoshi_dir, "src", "gnosis", "utils", "kalshi_client.py")
-        if os.path.isfile(path):
-            spec = importlib.util.spec_from_file_location("kalshi_client", path)
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            return mod.KalshiClient()
-    raise ImportError("KalshiClient not found")
+class KalshiClient:
+    """Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth."""
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(self):
+        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
+        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+        if not self.key_id:
+            raise ValueError("KALSHI_KEY_ID not set")
+        if not pk_raw:
+            for pk_path in [
+                os.path.expanduser("~/.kalshi/private_key.pem"),
+                "/root/.kalshi/private_key.pem",
+            ]:
+                if os.path.isfile(pk_path):
+                    with open(pk_path) as f:
+                        pk_raw = f.read().strip()
+                    break
+        if not pk_raw:
+            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
+
+        # Fix PEM formatting — env vars often have literal \n instead of newlines
+        pk_raw = self._fix_pem(pk_raw)
+
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
+
+    @staticmethod
+    def _fix_pem(raw: str) -> str:
+        """Normalize a PEM key that may have been mangled by env var storage."""
+        import re
+        # Replace literal \n with real newlines
+        if "\\n" in raw:
+            raw = raw.replace("\\n", "\n")
+        # Has headers but mangled onto one line
+        if "-----BEGIN" in raw and raw.count("\n") <= 2:
+            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
+            if m:
+                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
+                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
+                if header_match and footer_match:
+                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
+                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
+            return raw.strip()
+        # NO headers — raw base64 (possibly with spaces)
+        if "-----BEGIN" not in raw:
+            body = re.sub(r"\s+", "", raw)
+            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
+                lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
+        return raw.strip()
+
+    def _sign(self, method: str, path: str, body: str = "") -> dict:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        timestamp = str(int(time.time() * 1000))
+        message = timestamp + method + path + body
+        signature = self.private_key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        }
+
+    def _request(self, method: str, path: str, body: str = ""):
+        headers = self._sign(method, path, body)
+        url = self.BASE_URL + path
+        data = body.encode() if body else None
+        req = request.Request(url, data=data, headers=headers, method=method)
+        with request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
 
 
-def make_request(client, method: str, path: str, body: str = "") -> dict:
-    """Make an authenticated request to Kalshi API."""
-    import requests
-    from cryptography.hazmat.primitives import hashes
-    from cryptography.hazmat.primitives.asymmetric import padding
-
-    timestamp = str(int(time.time() * 1000))
-    message = timestamp + method + path + body
-    signature = client.private_key.sign(
-        message.encode(),
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH
-        ),
-        hashes.SHA256()
-    )
-
-    headers = {
-        "Content-Type": "application/json",
-        "KALSHI-ACCESS-KEY": client.key_id,
-        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
-        "KALSHI-ACCESS-TIMESTAMP": timestamp,
-    }
-
-    url = client.BASE_URL + path
-    if method == "GET":
-        resp = requests.get(url, headers=headers, timeout=10)
-    elif method == "POST":
-        resp = requests.post(url, headers=headers, data=body, timeout=10)
-    elif method == "DELETE":
-        resp = requests.delete(url, headers=headers, timeout=10)
-    else:
-        raise ValueError(f"Unknown method: {method}")
-
-    return resp.json()
-
-
-def place_order(client, ticker: str, side: str, count: int,
-                order_type: str = "market", price: int = None) -> dict:
-    """Place an order on Kalshi."""
+def place_order(client, ticker, side, count, order_type="market", price=None):
     path = "/portfolio/orders"
     payload = {
         "ticker": ticker,
-        "side": side,      # "yes" or "no"
+        "side": side,
         "action": "buy",
         "type": order_type,
         "count": count,
@@ -109,30 +170,8 @@ def place_order(client, ticker: str, side: str, count: int,
             payload["yes_price"] = price
         else:
             payload["no_price"] = price
-
     body = json.dumps(payload)
-    result = make_request(client, "POST", path, body)
-    return result
-
-
-def get_positions(client) -> dict:
-    """Get current portfolio positions."""
-    return make_request(client, "GET", "/portfolio/positions?limit=100")
-
-
-def get_orders(client) -> dict:
-    """Get open orders."""
-    return make_request(client, "GET", "/portfolio/orders?status=resting")
-
-
-def get_balance(client) -> dict:
-    """Get account balance."""
-    return make_request(client, "GET", "/portfolio/balance")
-
-
-def cancel_order(client, order_id: str) -> dict:
-    """Cancel an open order."""
-    return make_request(client, "DELETE", f"/portfolio/orders/{order_id}")
+    return client._request("POST", path, body)
 
 
 def main():
@@ -151,39 +190,36 @@ def main():
     load_env()
 
     try:
-        client = load_client()
+        client = KalshiClient()
+        print(f"Connected (key: {client.key_id[:12]}...)")
     except Exception as e:
         print(f"Error: {e}")
         sys.exit(1)
 
     if args.positions:
-        result = get_positions(client)
+        result = client._request("GET", "/portfolio/positions?limit=100")
         print(json.dumps(result, indent=2))
     elif args.orders:
-        result = get_orders(client)
+        result = client._request("GET", "/portfolio/orders?status=resting")
         print(json.dumps(result, indent=2))
     elif args.balance:
-        result = get_balance(client)
+        result = client._request("GET", "/portfolio/balance")
         print(json.dumps(result, indent=2))
     elif args.cancel:
-        result = cancel_order(client, args.cancel)
+        result = client._request("DELETE", f"/portfolio/orders/{args.cancel}")
         print(json.dumps(result, indent=2))
     elif args.ticker and args.side:
         print(f"Placing order: {args.count}x {args.side.upper()} on {args.ticker} ({args.type})")
         result = place_order(client, args.ticker, args.side, args.count,
                              args.type, args.price)
         print(json.dumps(result, indent=2))
-
-        if "order" in result:
+        if isinstance(result, dict) and "order" in result:
             order = result["order"]
-            print(f"\n✅ Order placed!")
+            print(f"\n Order placed!")
             print(f"   Order ID: {order.get('order_id')}")
             print(f"   Status:   {order.get('status')}")
-            print(f"   Ticker:   {order.get('ticker')}")
-            print(f"   Side:     {order.get('side')}")
-            print(f"   Count:    {order.get('initial_count')}")
-        elif "error" in result or "code" in result:
-            print(f"\n❌ Order failed: {result}")
+        elif isinstance(result, dict) and ("error" in result or "code" in result):
+            print(f"\n Order failed: {result}")
     else:
         parser.print_help()
 

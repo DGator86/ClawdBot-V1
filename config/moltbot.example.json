@@ -27,7 +27,6 @@
       "mode": "token",
       "token": "${GATEWAY_TOKEN}"
     }
-    "bind": "loopback"
   },
   "channels": {
     "telegram": {
