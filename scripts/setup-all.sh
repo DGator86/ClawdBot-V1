@@ -359,6 +359,12 @@ OPENAI_API_KEY=$OPENAI_API_KEY
 ENVEOF
 chmod 600 ~/.clawdbot/.env
 
+# Remove any leftover legacy config and stale state dir
+rm -f ~/.clawdbot/moltbot.json ~/.clawdbot/moltbot.json.bak 2>/dev/null
+rm -rf /root/.moltbot 2>/dev/null  # remove old state dir that triggers doctor warnings
+
+# Generate gateway auth token
+GATEWAY_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
 # Remove any leftover legacy config to avoid migration noise
 rm -f ~/.clawdbot/moltbot.json 2>/dev/null
 
@@ -387,6 +393,11 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
   "gateway": {
     "mode": "local",
     "port": 18789,
+    "bind": "loopback",
+    "auth": {
+      "mode": "token",
+      "token": "$GATEWAY_TOKEN"
+    }
     "bind": "loopback"
   },
   "channels": {
@@ -405,6 +416,7 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
 }
 MOLTEOF
 chmod 700 ~/.clawdbot
+ok "~/.clawdbot/moltbot.json (token: ${GATEWAY_TOKEN:0:8}...)"
 ok "~/.clawdbot/moltbot.json"
 
 # ================================================================
@@ -418,6 +430,10 @@ mkdir -p "$YOSHI_DIR/logs" 2>/dev/null || true
 # Find moltbot binary path
 MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/bin/moltbot")
 
+# Validate config (DO NOT run doctor --fix, it overwrites our token)
+echo "  Validating moltbot config..."
+cd "$CLAWDBOT_DIR"
+"$MOLTBOT_BIN" doctor --non-interactive 2>&1 | grep -E "Telegram:|Error:|Gateway" | head -5
 # Run moltbot doctor --fix to auto-migrate any remaining issues
 echo "  Validating moltbot config..."
 cd "$CLAWDBOT_DIR"
@@ -469,6 +485,35 @@ WantedBy=multi-user.target
 SVCEOF
 ok "yoshi-bridge.service"
 
+# Kalshi Edge Scanner service (continuous best-pick finder)
+mkdir -p "$CLAWDBOT_DIR/data" "$CLAWDBOT_DIR/logs" 2>/dev/null || true
+
+cat > /etc/systemd/system/kalshi-edge-scanner.service << SVCEOF
+[Unit]
+Description=Kalshi Edge Scanner — Continuous Best-Pick Finder
+After=network.target
+Wants=yoshi-bridge.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=$CLAWDBOT_DIR
+EnvironmentFile=$YOSHI_DIR/.env
+Environment=TRADING_CORE_URL=http://127.0.0.1:8000
+ExecStart=$YOSHI_DIR/venv/bin/python3 $CLAWDBOT_DIR/scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --min-edge 3.0 --propose
+Restart=always
+RestartSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-edge-scanner
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+ok "kalshi-edge-scanner.service"
+
+systemctl daemon-reload
+systemctl enable clawdbot yoshi-bridge kalshi-edge-scanner >/dev/null 2>&1
 systemctl daemon-reload
 systemctl enable clawdbot yoshi-bridge >/dev/null 2>&1
 ok "Enabled"
@@ -481,6 +526,11 @@ step 9 "Starting"
 systemctl restart yoshi-bridge 2>/dev/null || true
 sleep 2
 systemctl restart clawdbot 2>/dev/null || true
+sleep 2
+if $KALSHI_CONFIGURED; then
+    systemctl restart kalshi-edge-scanner 2>/dev/null || true
+fi
+sleep 3
 sleep 4
 
 echo ""
@@ -501,6 +551,14 @@ else
 fi
 [ "$BS" = "active" ] && ok "Yoshi-Bridge: RUNNING" || warn "Yoshi-Bridge: $BS — check: journalctl -u yoshi-bridge -n 20"
 $TRADING_CORE_UP && ok "Trading Core: RUNNING"
+
+if $KALSHI_CONFIGURED; then
+    ES=$(systemctl is-active kalshi-edge-scanner 2>/dev/null || echo "dead")
+    [ "$ES" = "active" ] && ok "Edge Scanner: RUNNING (every 2min)" || warn "Edge Scanner: $ES"
+    ok "Kalshi: CONFIGURED"
+else
+    warn "Kalshi: needs private key — edge scanner disabled"
+fi
 $KALSHI_CONFIGURED && ok "Kalshi: CONFIGURED" || warn "Kalshi: needs private key"
 
 # ================================================================
@@ -509,6 +567,7 @@ header "DONE"
 echo "Logs:"
 echo "  journalctl -u clawdbot -f"
 echo "  journalctl -u yoshi-bridge -f"
+echo "  journalctl -u kalshi-edge-scanner -f"
 echo ""
 echo "Status:"
 echo "  curl -s localhost:8000/status | python3 -m json.tool"

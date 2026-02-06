@@ -106,6 +106,100 @@ curl -s -X POST http://127.0.0.1:8000/kill-switch/deactivate
 
 **IMPORTANT**: The kill switch is an emergency measure. Warn the user before activating. Flatten closes ALL positions. Always confirm before executing either.
 
+## Kalshi Edge Scanner — Best Picks (PRIMARY)
+
+The Kalshi Edge Scanner runs continuously and finds the top 1-2 best contracts to trade RIGHT NOW. This is your primary tool for answering "what should I trade?" or "best Kalshi picks" or "find me value".
+
+### Read Current Top Picks
+
+When the user asks for the best trade, best picks, what to buy, where the value is, or anything about Kalshi opportunities:
+
+```bash
+cat /home/root/ClawdBot-V1/data/top_picks.json 2>/dev/null || cat /root/ClawdBot-V1/data/top_picks.json 2>/dev/null || echo "Edge scanner hasn't run yet"
+```
+
+Present each pick using this format:
+
+```
+🎯 KALSHI BEST PICK #1
+
+Contract: [ticker]
+Action:   BUY [YES/NO] @ [cost]c per contract
+Strike:   $XX,XXX
+Edge:     +X.X% (Model XX% vs Market XX%)
+EV:       +X.Xc per contract
+Risk:     $X.XX for [N] contracts
+Expires:  XX minutes
+
+Why: [Explain the edge — price is above/below strike, market is
+     mispricing the probability, expected value is positive]
+
+⚠️ Reply "approve" to place this trade or "pass" to skip.
+```
+
+### Run a Fresh Scan Now
+
+If the user wants fresh data or the picks file is stale (>5 min old):
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-edge-scanner.py --top 2 --min-edge 3.0 2>&1 | tail -40
+```
+
+### Check Scanner Status
+
+```bash
+pgrep -f kalshi-edge-scanner.py > /dev/null && echo "Edge Scanner: RUNNING" || echo "Edge Scanner: NOT RUNNING"
+```
+
+### Start the Scanner (continuous mode)
+
+```bash
+cd /home/root/ClawdBot-V1 && nohup python3 scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --propose > logs/edge-scanner.log 2>&1 &
+```
+
+### Place a Kalshi Order (after user approves)
+
+When the user approves a pick, use the order helper:
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --ticker TICKER_HERE --side SIDE_HERE --count COUNT_HERE
+```
+
+For a limit order at a specific price (in cents, 1-99):
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --ticker TICKER_HERE --side SIDE_HERE --count COUNT_HERE --type limit --price PRICE_CENTS
+```
+
+Replace TICKER_HERE (e.g., KXBTC-26FEB06-T64000), SIDE_HERE (yes or no), COUNT_HERE (number of contracts), and PRICE_CENTS (e.g., 45 for 45c).
+
+### Check Kalshi Portfolio
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --balance
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --positions
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --orders
+```
+
+### Cancel an Order
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-order.py --cancel ORDER_ID_HERE
+```
+
+**CRITICAL**: NEVER place an order without explicit user approval. Always show the full details first and wait for "approve", "yes", "do it", or similar confirmation.
+
+### Edge Scanner Scoring Model
+
+The scanner evaluates every open Kalshi crypto contract by:
+1. **Edge %** = Model probability - Market implied probability
+2. **EV (cents)** = Expected value per contract after cost
+3. **Kelly fraction** = Optimal position sizing (quarter-Kelly for safety)
+4. **Liquidity** = Tighter bid-ask spread = higher score
+5. **Composite Score** = Weighted combination of all factors
+
+Minimum thresholds: 3% edge, 1c EV. Contracts below these are filtered out.
+
 ## Kalshi Market Data (Direct API)
 
 ClawdBot can query Kalshi markets directly through Yoshi-Bot's Python client. The Kalshi API credentials are stored in Yoshi-Bot's `.env` file (`KALSHI_KEY_ID` and `KALSHI_PRIVATE_KEY`).
@@ -248,6 +342,103 @@ Restart the scanner if it's down:
 ```bash
 cd /home/root/Yoshi-Bot && source venv/bin/activate && nohup python3 scripts/kalshi_scanner.py --symbol BTCUSDT --loop --interval 300 --threshold 0.10 --live --exchange kraken > logs/scanner.log 2>&1 &
 ```
+
+## Kalshi Edge Scanner (Best Picks)
+
+The edge scanner runs continuously and writes the current best 1-2 Kalshi contracts to a JSON file. This is the **primary way** to find profitable trades.
+
+### Check Current Top Picks
+
+When the user asks "best Kalshi picks", "what should I trade", "find me edge", or "best contracts":
+
+```bash
+cat /home/root/ClawdBot-V1/data/top_picks.json 2>/dev/null || cat /root/ClawdBot-V1/data/top_picks.json 2>/dev/null || echo "Edge scanner not running yet"
+```
+
+Present each pick like this:
+
+```
+🎯 KALSHI BEST PICK #1
+
+Contract: KXBTC-26FEB06-T64000
+Action:   BUY YES @ 42c
+Strike:   Above $64,000
+Edge:     +8.3% (Model 50.3% vs Market 42.0%)
+EV:       +4.8c per contract
+Size:     5 contracts ($2.10 total risk)
+Expires:  47 min
+
+🎯 KALSHI BEST PICK #2
+
+Contract: KXBTC-26FEB06-T62000
+Action:   BUY NO @ 35c
+Strike:   Above $62,000
+Edge:     +5.1% (Model 70.1% vs Market 65.0%)
+EV:       +2.3c per contract
+Size:     3 contracts ($1.05 total risk)
+Expires:  47 min
+
+Reply "approve 1" or "approve 2" to execute.
+```
+
+### Run a Manual Scan
+
+```bash
+cd /home/root/ClawdBot-V1 && python3 scripts/kalshi-edge-scanner.py --top 2 2>&1 | tail -40
+```
+
+### Check Scanner Status
+
+```bash
+pgrep -f kalshi-edge-scanner.py > /dev/null && echo "Edge Scanner: RUNNING" || echo "Edge Scanner: NOT RUNNING"
+```
+
+### Start the Edge Scanner
+
+```bash
+cd /home/root/ClawdBot-V1 && nohup python3 scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --propose > logs/edge-scanner.log 2>&1 &
+```
+
+Or restart the systemd service:
+```bash
+sudo systemctl restart kalshi-edge-scanner
+```
+
+### Place a Kalshi Order (after user approves)
+
+When the user says "approve", "execute", or "buy it":
+
+```bash
+cd /root/Yoshi-Bot && source venv/bin/activate && python3 -c "
+from src.gnosis.utils.kalshi_client import KalshiClient
+import json, uuid
+client = KalshiClient()
+# Read the approved pick from top_picks.json
+with open('/root/ClawdBot-V1/data/top_picks.json') as f:
+    picks = json.load(f)['top_picks']
+pick = picks[0]  # or picks[1] for #2
+# Place the order
+order = {
+    'ticker': pick['ticker'],
+    'side': pick['side'],
+    'action': pick['action'],
+    'type': 'limit',
+    'count': pick['suggested_contracts'],
+    'client_order_id': str(uuid.uuid4()),
+}
+if pick['side'] == 'yes':
+    order['yes_price'] = pick['cost_cents']
+else:
+    order['no_price'] = pick['cost_cents']
+print(f'Placing order: {json.dumps(order, indent=2)}')
+# Uncomment to execute:
+# result = client.create_order(order)
+# print(json.dumps(result, indent=2))
+print('⚠️  Order placement is currently in review mode. Uncomment create_order to go live.')
+"
+```
+
+**CRITICAL**: Always show the full order details and get explicit "yes" or "approve" from the user before placing any Kalshi order. Never auto-execute.
 
 ## Behavioral Rules
 
