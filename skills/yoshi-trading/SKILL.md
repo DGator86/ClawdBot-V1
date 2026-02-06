@@ -328,13 +328,40 @@ print(f'Jump risk: {r.jump_prob:.1%}')
 cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.data --symbol BTCUSDT
 ```
 
-### Run Walk-Forward Backtest
+### Run Walk-Forward Backtest (Full Pipeline)
 
-When the user asks about performance, backtest, or evaluation:
+When the user asks about performance, backtest, or evaluation. **Default runs the full 12/12 pipeline with Monte Carlo enabled** -- same code path as production:
 
 ```bash
 cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation --symbol BTCUSDT --bars 1000 --max-forecasts 30
 ```
+
+Options:
+- `--enable-mc` (default: ON) — runs full 12-module pipeline with MC
+- `--no-mc` — disables Monte Carlo for faster but partial evaluation
+- `--mc-iterations 20000` — MC iterations per forecast step (default 20k)
+- `--barrier 65000` — fixed Kalshi barrier strike (auto-derived from price if omitted)
+- `--step 24` — bars between forecasts (default 24 = one per day)
+- `--horizon 24` — forecast horizon in hours
+
+Full-pipeline backtest with custom MC:
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation -s BTCUSDT --bars 1000 --max-forecasts 50 --mc-iterations 50000 --barrier 70000
+```
+
+Fast partial backtest (MC off, 10/12 modules):
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation -s BTCUSDT --bars 1000 --no-mc
+```
+
+The full-pipeline report includes:
+- **Direction**: hit rate, MCC
+- **Distribution**: pinball loss, CRPS
+- **Tail risk**: Brier scores for jumps/crashes
+- **Monte Carlo**: VaR calibration (breach rates vs targets), CVaR accuracy, P5-P95 envelope coverage, MC price MAE
+- **Barrier/Kalshi**: barrier Brier score, barrier hit rate, barrier calibration bins
+- **Per-regime**: metrics broken down by detected regime (trend_up, cascade_risk, etc.) with per-regime VaR and barrier accuracy
+- **Per-volatility-bucket**: low/normal/high/extreme vol performance
 
 ### The 12 Paradigms
 

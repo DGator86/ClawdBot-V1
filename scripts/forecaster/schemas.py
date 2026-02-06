@@ -176,6 +176,9 @@ class EvalMetrics:
     # Calibration
     calibration_bins: dict = field(default_factory=dict)
 
+    # Monte Carlo full-pipeline metrics
+    mc_metrics: dict = field(default_factory=dict)
+
     # Per-regime breakdown
     metrics_by_regime: dict = field(default_factory=dict)
     metrics_by_vol_bucket: dict = field(default_factory=dict)

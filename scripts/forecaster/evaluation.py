@@ -175,7 +175,7 @@ def calibration_bins(predicted_probs: list[float], actual_outcomes: list[bool],
 
 @dataclass
 class EvalRecord:
-    """Single forecast + outcome pair."""
+    """Single forecast + outcome pair — captures full pipeline output."""
     timestamp: float = 0.0
     predicted_direction_prob: float = 0.5
     predicted_return: float = 0.0
@@ -191,6 +191,26 @@ class EvalRecord:
     actual_crash: bool = False    # return < -3*vol
     regime: str = "range"
     vol_bucket: str = "normal"
+
+    # ── Monte Carlo outputs (full pipeline) ────────────────
+    mc_ran: bool = False
+    mc_var_95: float = 0.0
+    mc_var_99: float = 0.0
+    mc_cvar_95: float = 0.0
+    mc_cvar_99: float = 0.0
+    mc_mean_price: float = 0.0
+    mc_median_price: float = 0.0
+    mc_p5_price: float = 0.0
+    mc_p95_price: float = 0.0
+    predicted_price: float = 0.0
+    actual_price: float = 0.0
+    current_price: float = 0.0
+
+    # ── Barrier outputs (Kalshi integration) ────────────────
+    barrier_strike: float = 0.0
+    barrier_above_prob: float = 0.5
+    actual_breached_above: bool = False
+    actual_max_price: float = 0.0       # highest price during horizon
 
 
 class WalkForwardEvaluator:
@@ -219,13 +239,16 @@ class WalkForwardEvaluator:
                  horizon_hours: float = 24,
                  min_history: int = 168,   # 1 week of hourly bars
                  step_size: int = 24,       # forecast every 24 hours
-                 embargo: int = 1):
-        self.forecaster = forecaster or Forecaster(enable_mc=False)
+                 embargo: int = 1,
+                 barrier_strike: Optional[float] = None):
+        # Default: full pipeline with MC enabled (same as production)
+        self.forecaster = forecaster or Forecaster(enable_mc=True)
         self.bars = bars or []
         self.horizon_hours = horizon_hours
         self.min_history = min_history
         self.step_size = step_size
         self.embargo = embargo
+        self.barrier_strike = barrier_strike
         self.records: list[EvalRecord] = []
 
     def run(self, symbol: str = "BTCUSDT",
@@ -259,10 +282,20 @@ class WalkForwardEvaluator:
                 timestamp=history[-1].timestamp if history else 0,
             )
 
-            # Forecast
+            # ── Compute barrier strike for this step ──────
+            # Auto-derive from current price if not set explicitly
+            bar_strike = self.barrier_strike
+            current_price = self.bars[idx - 1].close
+            if bar_strike is None and current_price > 0:
+                # Use nearest round number above current price as
+                # a realistic Kalshi-style barrier
+                magnitude = 10 ** max(0, int(math.log10(current_price)) - 1)
+                bar_strike = math.ceil(current_price / magnitude) * magnitude
+
+            # Forecast — FULL pipeline (all 12 modules + MC)
             try:
                 result = self.forecaster.forecast_from_snapshot(
-                    snap, self.horizon_hours
+                    snap, self.horizon_hours, barrier_strike=bar_strike
                 )
             except Exception as e:
                 if verbose:
@@ -276,12 +309,16 @@ class WalkForwardEvaluator:
                 break
 
             actual_price = self.bars[future_idx].close
-            current_price = self.bars[idx - 1].close
             if current_price <= 0 or actual_price <= 0:
                 idx += self.step_size
                 continue
 
             actual_return = math.log(actual_price / current_price)
+
+            # Actual max price during horizon (for barrier evaluation)
+            horizon_slice = self.bars[idx:future_idx + 1]
+            actual_max_price = max(b.high for b in horizon_slice) if horizon_slice else actual_price
+            actual_breached = (actual_max_price >= bar_strike) if bar_strike else False
 
             # Compute vol for threshold-based metrics
             recent_rets = []
@@ -309,15 +346,35 @@ class WalkForwardEvaluator:
                 actual_crash=(actual_return < -3 * horizon_vol),
                 regime=result.regime,
                 vol_bucket=self._vol_bucket(horizon_vol),
+                # ── MC outputs ──────────────────────────────
+                mc_ran=bool(result.mc_summary),
+                mc_var_95=result.var_95,
+                mc_var_99=result.var_99,
+                mc_cvar_95=result.cvar_95,
+                mc_cvar_99=result.cvar_99,
+                mc_mean_price=result.mc_summary.get("mc_mean_price", 0),
+                mc_median_price=result.mc_summary.get("mc_median_price", 0),
+                mc_p5_price=result.mc_summary.get("mc_p5_price", 0),
+                mc_p95_price=result.mc_summary.get("mc_p95_price", 0),
+                predicted_price=result.predicted_price,
+                actual_price=actual_price,
+                current_price=current_price,
+                # ── Barrier outputs ─────────────────────────
+                barrier_strike=bar_strike or 0.0,
+                barrier_above_prob=result.barrier_above_prob,
+                actual_breached_above=actual_breached,
+                actual_max_price=actual_max_price,
             )
             self.records.append(record)
             n_forecasts += 1
 
+            mc_tag = " [MC]" if record.mc_ran else ""
             if verbose and n_forecasts % 10 == 0:
                 elapsed = time.time() - t0
-                print(f"  {n_forecasts} forecasts in {elapsed:.1f}s "
-                      f"(latest return: {actual_return:.4f}, "
-                      f"predicted: {result.targets.expected_return:.4f})")
+                print(f"  {n_forecasts} forecasts in {elapsed:.1f}s{mc_tag} "
+                      f"(ret: {actual_return:+.4f}, "
+                      f"pred: {result.targets.expected_return:+.4f}, "
+                      f"regime: {result.regime})")
 
             idx += self.step_size
 
@@ -370,6 +427,94 @@ class WalkForwardEvaluator:
         # ── Calibration ───────────────────────────────────
         metrics.calibration_bins = calibration_bins(pred_dirs, actual_dirs)
 
+        # ══════════════════════════════════════════════════
+        # MONTE CARLO METRICS (full pipeline scoring)
+        # ══════════════════════════════════════════════════
+        mc_records = [r for r in self.records if r.mc_ran]
+        if mc_records:
+            mc_m = metrics.mc_metrics  # shorthand
+            mc_m["n_mc_forecasts"] = len(mc_records)
+
+            # ── VaR accuracy: did actual loss exceed VaR? ──
+            # VaR(95) should be breached ~5% of the time
+            var95_breaches = sum(
+                1 for r in mc_records
+                if r.actual_return < r.mc_var_95
+            )
+            var99_breaches = sum(
+                1 for r in mc_records
+                if r.actual_return < r.mc_var_99
+            )
+            n_mc = len(mc_records)
+            mc_m["var95_breach_rate"] = var95_breaches / n_mc
+            mc_m["var99_breach_rate"] = var99_breaches / n_mc
+            mc_m["var95_expected_rate"] = 0.05
+            mc_m["var99_expected_rate"] = 0.01
+            # How well-calibrated: ideal breach rate = alpha
+            mc_m["var95_calibration_gap"] = abs(
+                mc_m["var95_breach_rate"] - 0.05
+            )
+            mc_m["var99_calibration_gap"] = abs(
+                mc_m["var99_breach_rate"] - 0.01
+            )
+
+            # ── CVaR accuracy: avg loss when VaR breached ──
+            var95_breach_losses = [
+                r.actual_return for r in mc_records
+                if r.actual_return < r.mc_var_95
+            ]
+            if var95_breach_losses:
+                actual_cvar95 = sum(var95_breach_losses) / len(var95_breach_losses)
+                pred_cvars = [
+                    r.mc_cvar_95 for r in mc_records
+                    if r.actual_return < r.mc_var_95
+                ]
+                mc_m["cvar95_actual"] = actual_cvar95
+                mc_m["cvar95_predicted_avg"] = (
+                    sum(pred_cvars) / len(pred_cvars) if pred_cvars else 0
+                )
+                mc_m["cvar95_mae"] = abs(
+                    mc_m["cvar95_actual"] - mc_m["cvar95_predicted_avg"]
+                )
+
+            # ── MC price distribution accuracy ──────────────
+            # Check if actual prices fall within predicted envelopes
+            in_5_95 = sum(
+                1 for r in mc_records
+                if r.mc_p5_price > 0 and r.mc_p5_price <= r.actual_price <= r.mc_p95_price
+            )
+            mc_m["p5_p95_coverage"] = in_5_95 / n_mc
+            mc_m["p5_p95_expected"] = 0.90
+            mc_m["p5_p95_gap"] = abs(mc_m["p5_p95_coverage"] - 0.90)
+
+            # MC predicted price MAE
+            mc_price_errors = [
+                abs(r.mc_mean_price - r.actual_price) / r.current_price
+                for r in mc_records
+                if r.current_price > 0 and r.mc_mean_price > 0
+            ]
+            if mc_price_errors:
+                mc_m["mc_price_mae_pct"] = sum(mc_price_errors) / len(mc_price_errors)
+
+            # ── Barrier probability (Kalshi) Brier score ────
+            barrier_records = [
+                r for r in mc_records if r.barrier_strike > 0
+            ]
+            if barrier_records:
+                barrier_preds = [r.barrier_above_prob for r in barrier_records]
+                barrier_actuals = [r.actual_breached_above for r in barrier_records]
+                mc_m["barrier_brier_score"] = brier_score(
+                    barrier_preds, barrier_actuals
+                )
+                mc_m["barrier_hit_rate"] = sum(
+                    1 for p, a in zip(barrier_preds, barrier_actuals)
+                    if (p > 0.5) == a
+                ) / len(barrier_records)
+                mc_m["n_barrier_forecasts"] = len(barrier_records)
+                mc_m["barrier_calibration"] = calibration_bins(
+                    barrier_preds, barrier_actuals, n_bins=5
+                )
+
         # ── Per-regime breakdown ──────────────────────────
         regimes = set(r.regime for r in self.records)
         for regime in regimes:
@@ -378,7 +523,7 @@ class WalkForwardEvaluator:
                 continue
             rp_dirs = [r.predicted_direction_prob for r in regime_records]
             ra_rets = [r.actual_return for r in regime_records]
-            metrics.metrics_by_regime[regime] = {
+            regime_info = {
                 "count": len(regime_records),
                 "hit_rate": hit_rate(rp_dirs, ra_rets),
                 "mcc": matthews_correlation(rp_dirs, ra_rets),
@@ -386,6 +531,18 @@ class WalkForwardEvaluator:
                     [r.predicted_return for r in regime_records], ra_rets
                 ),
             }
+            # Per-regime MC metrics
+            mc_regime = [r for r in regime_records if r.mc_ran]
+            if mc_regime:
+                v95_breach = sum(1 for r in mc_regime if r.actual_return < r.mc_var_95)
+                regime_info["mc_var95_breach_rate"] = v95_breach / len(mc_regime)
+                b_regime = [r for r in mc_regime if r.barrier_strike > 0]
+                if b_regime:
+                    regime_info["barrier_hit_rate"] = sum(
+                        1 for r in b_regime
+                        if (r.barrier_above_prob > 0.5) == r.actual_breached_above
+                    ) / len(b_regime)
+            metrics.metrics_by_regime[regime] = regime_info
             metrics.hit_rate_by_regime[regime] = hit_rate(rp_dirs, ra_rets)
 
         # ── Per-vol-bucket breakdown ──────────────────────
@@ -422,9 +579,9 @@ class WalkForwardEvaluator:
 # ═══════════════════════════════════════════════════════════════
 
 def print_eval_report(metrics: EvalMetrics, n_records: int = 0):
-    """Pretty-print evaluation results."""
+    """Pretty-print evaluation results — full pipeline including MC."""
     print(f"\n{'='*64}")
-    print(f"  ENSEMBLE FORECASTER EVALUATION REPORT")
+    print(f"  FULL-PIPELINE EVALUATION REPORT (12/12 modules)")
     print(f"{'='*64}")
     if n_records > 0:
         print(f"  Forecast samples:  {n_records}")
@@ -443,13 +600,71 @@ def print_eval_report(metrics: EvalMetrics, n_records: int = 0):
     print(f"    MAE:             {metrics.mae:>8.6f}")
     print(f"    IC (rank corr):  {metrics.ic:>8.4f}")
 
+    # ══════════════════════════════════════════════════════
+    # MONTE CARLO METRICS
+    # ══════════════════════════════════════════════════════
+    mc_m = metrics.mc_metrics
+    if mc_m:
+        n_mc = mc_m.get("n_mc_forecasts", 0)
+        print(f"\n{'─'*64}")
+        print(f"  MONTE CARLO METRICS ({n_mc} forecasts with MC):")
+
+        # VaR calibration
+        if "var95_breach_rate" in mc_m:
+            v95_rate = mc_m["var95_breach_rate"]
+            v95_gap = mc_m["var95_calibration_gap"]
+            v95_q = "GOOD" if v95_gap < 0.03 else "FAIR" if v95_gap < 0.08 else "POOR"
+            print(f"    VaR(95%) breach:  {v95_rate*100:>6.1f}% (target: 5.0%) [{v95_q}]")
+        if "var99_breach_rate" in mc_m:
+            v99_rate = mc_m["var99_breach_rate"]
+            v99_gap = mc_m["var99_calibration_gap"]
+            v99_q = "GOOD" if v99_gap < 0.02 else "FAIR" if v99_gap < 0.05 else "POOR"
+            print(f"    VaR(99%) breach:  {v99_rate*100:>6.1f}% (target: 1.0%) [{v99_q}]")
+
+        # CVaR accuracy
+        if "cvar95_mae" in mc_m:
+            print(f"    CVaR(95%) MAE:    {mc_m['cvar95_mae']*100:>6.2f}%")
+            print(f"    CVaR(95%) pred:   {mc_m['cvar95_predicted_avg']*100:>6.2f}%")
+            print(f"    CVaR(95%) actual: {mc_m['cvar95_actual']*100:>6.2f}%")
+
+        # Price envelope coverage
+        if "p5_p95_coverage" in mc_m:
+            cov = mc_m["p5_p95_coverage"]
+            cov_gap = mc_m["p5_p95_gap"]
+            cov_q = "GOOD" if cov_gap < 0.05 else "FAIR" if cov_gap < 0.15 else "POOR"
+            print(f"    P5-P95 coverage:  {cov*100:>6.1f}% (target: 90.0%) [{cov_q}]")
+
+        # MC price MAE
+        if "mc_price_mae_pct" in mc_m:
+            print(f"    MC Price MAE:     {mc_m['mc_price_mae_pct']*100:>6.2f}%")
+
+        # Barrier (Kalshi)
+        if "barrier_brier_score" in mc_m:
+            print(f"\n  BARRIER / KALSHI METRICS ({mc_m.get('n_barrier_forecasts', 0)} contracts):")
+            print(f"    Barrier Brier:    {mc_m['barrier_brier_score']:>8.6f}")
+            print(f"    Barrier Hit Rate: {mc_m['barrier_hit_rate']*100:>6.1f}%")
+            if "barrier_calibration" in mc_m:
+                print(f"    Barrier Calibration:")
+                for bin_name, info in sorted(mc_m["barrier_calibration"].items()):
+                    pred = info["mean_predicted"]
+                    obs = info["observed_rate"]
+                    gap = abs(pred - obs)
+                    q = "GOOD" if gap < 0.1 else "FAIR" if gap < 0.2 else "POOR"
+                    print(f"      {bin_name:10s} n={info['count']:3d} "
+                          f"pred={pred:.3f} obs={obs:.3f} [{q}]")
+
     if metrics.metrics_by_regime:
         print(f"\n  PER-REGIME BREAKDOWN:")
         for regime, rm in sorted(metrics.metrics_by_regime.items()):
-            print(f"    {regime:20s} n={rm['count']:3d} "
-                  f"HR={rm['hit_rate']*100:.1f}% "
-                  f"MCC={rm['mcc']:.3f} "
-                  f"IC={rm['ic']:.3f}")
+            line = (f"    {regime:20s} n={rm['count']:3d} "
+                    f"HR={rm['hit_rate']*100:.1f}% "
+                    f"MCC={rm['mcc']:.3f} "
+                    f"IC={rm['ic']:.3f}")
+            if "mc_var95_breach_rate" in rm:
+                line += f" VaR95br={rm['mc_var95_breach_rate']*100:.0f}%"
+            if "barrier_hit_rate" in rm:
+                line += f" BarrHR={rm['barrier_hit_rate']*100:.0f}%"
+            print(line)
 
     if metrics.metrics_by_vol_bucket:
         print(f"\n  PER-VOL-BUCKET BREAKDOWN:")
@@ -459,7 +674,7 @@ def print_eval_report(metrics: EvalMetrics, n_records: int = 0):
                   f"MCC={bm['mcc']:.3f}")
 
     if metrics.calibration_bins:
-        print(f"\n  CALIBRATION (predicted vs observed):")
+        print(f"\n  DIRECTION CALIBRATION (predicted vs observed):")
         for bin_name, info in sorted(metrics.calibration_bins.items()):
             pred = info["mean_predicted"]
             obs = info["observed_rate"]
@@ -493,9 +708,19 @@ def main():
     parser.add_argument("--step", type=int, default=24,
                         help="Bars between forecasts")
     parser.add_argument("--max-forecasts", type=int, default=100)
+    parser.add_argument("--enable-mc", action="store_true", default=True,
+                        help="Enable Monte Carlo (default: ON for full pipeline)")
+    parser.add_argument("--no-mc", action="store_true",
+                        help="Disable Monte Carlo (faster, but partial pipeline)")
+    parser.add_argument("--mc-iterations", type=int, default=20_000,
+                        help="MC iterations per forecast (default: 20000)")
+    parser.add_argument("--barrier", type=float, default=None,
+                        help="Fixed barrier strike (auto-derived if not set)")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", "-o", type=str, default=None)
     args = parser.parse_args()
+    if args.no_mc:
+        args.enable_mc = False
 
     from .data import fetch_ohlcv_bars
 
@@ -507,16 +732,21 @@ def main():
         print("Not enough data for meaningful evaluation. Need 200+ bars.")
         return
 
-    fc = Forecaster(enable_mc=False)  # disable MC for speed in backtest
+    fc = Forecaster(
+        enable_mc=args.enable_mc,
+        mc_iterations=args.mc_iterations,
+    )
     evaluator = WalkForwardEvaluator(
         forecaster=fc,
         bars=bars,
         horizon_hours=args.horizon,
         step_size=args.step,
+        barrier_strike=args.barrier,
     )
 
+    mc_label = f"MC ON ({args.mc_iterations:,} iter)" if args.enable_mc else "MC OFF"
     print(f"\nRunning walk-forward evaluation "
-          f"(max {args.max_forecasts} forecasts, step={args.step})...")
+          f"(max {args.max_forecasts} forecasts, step={args.step}, {mc_label})...")
     metrics = evaluator.run(
         symbol=args.symbol,
         max_forecasts=args.max_forecasts,
@@ -536,9 +766,12 @@ def main():
             "mae": metrics.mae,
             "ic": metrics.ic,
             "calibration": metrics.calibration_bins,
+            "monte_carlo": metrics.mc_metrics,
             "by_regime": metrics.metrics_by_regime,
             "by_vol_bucket": metrics.metrics_by_vol_bucket,
             "n_records": len(evaluator.records),
+            "mc_enabled": args.enable_mc,
+            "mc_iterations": args.mc_iterations if args.enable_mc else 0,
         }
         output_str = json.dumps(output, indent=2)
         if args.output:
