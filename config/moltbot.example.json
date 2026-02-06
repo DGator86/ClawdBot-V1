@@ -3,7 +3,8 @@
     "defaults": {
       "workspace": "~/clawd",
       "model": {
-        "primary": "openai/gpt-4o"
+        "primary": "google/gemini-3-flash-preview",
+        "fallbacks": ["google/gemini-2.5-flash", "openai/gpt-4o-mini"]
       },
       "thinkingDefault": "low"
     },
@@ -14,7 +15,7 @@
         "identity": {
           "name": "ClawdBot",
           "theme": "crypto trading assistant",
-          "emoji": "🤖"
+          "emoji": "\ud83e\udd16"
         }
       }
     ]
@@ -38,7 +39,7 @@
   },
   "skills": {
     "load": {
-      "extraDirs": ["./skills"]
+      "extraDirs": ["/root/ClawdBot-V1/skills"]
     }
   }
 }

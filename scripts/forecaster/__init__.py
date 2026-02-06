@@ -23,4 +23,7 @@ Usage:
 """
 from .engine import Forecaster, ForecastResult
 
-__all__ = ["Forecaster", "ForecastResult"]
+__all__ = [
+    "Forecaster",
+    "ForecastResult",
+]

@@ -200,72 +200,59 @@ Plus natural language queries like:
 - "Propose a BTC trade"
 - "Kill switch NOW"
 
-## Kalshi Integration
-
-ClawdBot connects to Kalshi prediction markets through Yoshi-Bot's signal engine. The integration uses the Kalshi V2 API with RSA-PSS authentication.
-
-### How It Works
-
-1. **Yoshi-Bot** (`kalshi_scanner.py`) continuously scans Kalshi crypto markets (KXBTC, KXETH) for mispriced opportunities using the Price-Time Manifold model with Monte Carlo simulations (2000 sims per timeframe).
-2. **Yoshi-Bridge** (`yoshi-bridge.py`) watches the scanner log and forwards qualifying signals (edge >= 5%) to the Trading Core `/propose` endpoint.
-3. **ClawdBot** reads the Trading Core API and presents actionable Kalshi suggestions via Telegram, complete with edge %, strike, probability, and recommended action.
-4. **You** review and approve/reject trades via Telegram.
-
-### Kalshi API Setup
-
-1. Get your API credentials from [Kalshi Account API](https://kalshi.com/account/api)
-2. Add credentials to Yoshi-Bot's `.env`:
-   ```bash
-   KALSHI_KEY_ID=6858062e-6884-43b5-b002-0e13391be331
-   KALSHI_PRIVATE_KEY="-----BEGIN RSA PRIVATE KEY-----
-   ... your key ...
-   -----END RSA PRIVATE KEY-----"
-   ```
-3. Or use a PEM file: store at `~/.kalshi/private_key.pem` (chmod 600)
-4. The deploy script (`scripts/deploy-bridge.sh`) will prompt for these during setup
-
-### Supported Kalshi Markets
-
-| Series | Symbol | Description |
-|--------|--------|-------------|
-| KXBTC | BTCUSDT | Bitcoin hourly price contracts |
-| KXETH | ETHUSDT | Ethereum hourly price contracts |
-
-### Kalshi Commands via Telegram
-
-Ask ClawdBot in natural language:
-- "Check Kalshi exchange status"
-- "Show me active BTC Kalshi markets"
-- "What Kalshi signals does Yoshi have?"
-- "Is Kalshi API connected?"
-- "Show Kalshi market for KXBTC-25FEB06-T100000"
-
 ## Managing Services
 
+All services are managed via systemd. Install with:
+
 ```bash
+bash scripts/services/install.sh --start
+```
+
+```bash
+# Check all service status
+bash scripts/services/install.sh --status
+
 # View logs
 sudo journalctl -u clawdbot -f
+sudo journalctl -u kalshi-edge-scanner -f
 sudo journalctl -u yoshi-bridge -f
 
-# Restart
-sudo systemctl restart clawdbot
-sudo systemctl restart yoshi-bridge
+# Restart all
+bash scripts/services/install.sh --restart
 
-# Check status
-sudo systemctl status clawdbot
-sudo systemctl status yoshi-bridge
+# Restart individual service
+sudo systemctl restart clawdbot
 
 # Check Yoshi Trading Core directly
 curl -s http://127.0.0.1:8000/status | python3 -m json.tool
-curl -s http://127.0.0.1:8000/positions | python3 -m json.tool
+```
+
+### Operations Utilities
+
+```bash
+# Fix Kalshi PEM keys across all locations
+python3 scripts/lib/pem_utils.py
+
+# Unify Telegram tokens (dry-run)
+python3 scripts/lib/env_sync.py
+
+# Unify Telegram tokens (apply)
+python3 scripts/lib/env_sync.py --apply
+
+# Rebuild moltbot.json with model auto-detection
+python3 scripts/rebuild-config.py
+
+# Nuclear gateway fix (kills everything, rebuilds, restarts)
+bash scripts/fix-gateway.sh
 ```
 
 ### Troubleshooting
 
 **Bot not responding:**
-1. Check if the service is running: `sudo systemctl status clawdbot`
+1. Check if the service is running: `bash scripts/services/install.sh --status`
 2. Check logs for errors: `sudo journalctl -u clawdbot -n 100`
-3. Verify your tokens are correct in `.env`
+3. Verify your tokens: `python3 scripts/lib/env_sync.py`
+4. Nuclear fix: `bash scripts/fix-gateway.sh`
 
 **Connection issues:**
 1. Ensure port 18789 is open (for local gateway)
@@ -273,9 +260,9 @@ curl -s http://127.0.0.1:8000/positions | python3 -m json.tool
 3. Restart: `sudo systemctl restart clawdbot`
 
 **Kalshi API errors:**
-1. Verify credentials: ask ClawdBot "Is Kalshi API connected?"
-2. Check Kalshi exchange status: may be outside trading hours
-3. Ensure `KALSHI_KEY_ID` and `KALSHI_PRIVATE_KEY` are set in Yoshi-Bot's `.env`
+1. Fix PEM keys: `python3 scripts/lib/pem_utils.py`
+2. Verify credentials: ask ClawdBot "Is Kalshi API connected?"
+3. Check exchange status: may be outside trading hours
 
 ## Project Structure
 
@@ -284,17 +271,37 @@ ClawdBot-V1/
 ├── .env.example                    # Environment template
 ├── package.json                    # Node.js project (moltbot dep)
 ├── config/
-│   └── moltbot.example.json        # Moltbot gateway config
+│   └── moltbot.example.json        # Moltbot gateway config (with model fallbacks)
 ├── skills/
 │   └── yoshi-trading/
 │       └── SKILL.md                # Yoshi-Trading bridge skill
 ├── scripts/
 │   ├── deploy-bridge.sh            # Full bridge deployment (8 steps)
+│   ├── fix-gateway.sh              # Nuclear gateway fix (kills stale, rebuilds config)
+│   ├── setup-all.sh                # All-in-one VPS setup (curl-friendly)
+│   ├── rebuild-config.py           # Rebuild moltbot.json with model selection
 │   ├── yoshi-bridge.py             # Scanner log -> Trading Core bridge
-│   ├── deploy.sh                   # Legacy VPS deployment
-│   ├── install.sh                  # One-line installer
-│   ├── setup-telegram.sh           # Telegram key setup
-│   └── clawdbot.service            # Systemd unit template
+│   ├── kalshi-edge-scanner.py      # Continuous Kalshi best-pick finder
+│   ├── kalshi-order.py             # Kalshi order placement helper
+│   ├── lib/
+│   │   ├── pem_utils.py            # Shared PEM key normalization
+│   │   └── env_sync.py             # Telegram token unification + env sync
+│   ├── services/
+│   │   ├── install.sh              # Systemd service installer
+│   │   ├── clawdbot.service        # Gateway + Telegram service
+│   │   ├── kalshi-edge-scanner.service  # Edge scanner service
+│   │   └── yoshi-bridge.service    # Bridge service
+│   ├── forecaster/                 # 12-paradigm ensemble forecaster
+│   │   ├── engine.py               # Ensemble orchestrator
+│   │   ├── modules.py              # All 12 prediction modules
+│   │   ├── evaluation.py           # Walk-forward backtester
+│   │   ├── data.py                 # OHLCV data fetcher (Coinbase/Kraken)
+│   │   ├── schemas.py              # Module interfaces & data types
+│   │   └── bridge.py               # Forecaster -> edge scanner bridge
+│   └── monte-carlo/
+│       ├── simulation.py           # MC engine (legacy + live forecaster modes)
+│       ├── index.html              # Web dashboard
+│       └── server.py               # Dashboard HTTP server
 └── moltbot-setup/
     ├── SETUP-GUIDE.md              # DigitalOcean setup guide
     └── install-moltbot.sh          # DO installer

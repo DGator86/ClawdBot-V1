@@ -74,9 +74,16 @@ def log(msg: str, level: str = "INFO"):
         pass
 
 
-# ── .env loader ──────────────────────────────────────────
+# ── .env loader (uses shared pem_utils when available) ───
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
 _FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
+
+# Try to use shared utilities
+try:
+    from scripts.lib.pem_utils import fix_pem as _shared_fix_pem, load_env_file as _shared_load_env
+    _HAS_SHARED_UTILS = True
+except ImportError:
+    _HAS_SHARED_UTILS = False
 
 
 def _source_env(path: str):
@@ -160,12 +167,11 @@ class KalshiClient:
     def _fix_pem(raw: str) -> str:
         """
         Normalize a PEM key that may have been mangled by env var storage.
-        Handles:
-          - literal \\n instead of real newlines
-          - single-line PEM with headers but no line breaks
-          - raw base64 with NO headers at all (spaces instead of newlines)
-          - raw base64 with no whitespace at all
+        Delegates to shared pem_utils when available; falls back to inline logic.
         """
+        if _HAS_SHARED_UTILS:
+            return _shared_fix_pem(raw)
+
         import re
 
         # Replace literal \n with real newlines
