@@ -83,41 +83,77 @@ def _log(msg: str):
 def fetch_coinbase_klines(symbol: str, granularity: int = 3600,
                            limit: int = 200) -> list[Bar]:
     """
-    Fetch OHLCV candles from Coinbase Exchange.
+    Fetch OHLCV candles from Coinbase Exchange with pagination.
     granularity: seconds per candle (3600=1h, 14400=4h, 86400=1d)
-    Coinbase returns max 300 candles per request.
+    Coinbase returns max 300 candles per request — we paginate backward
+    from now to collect up to `limit` bars.
     """
     cb_symbol = COINBASE_SYMBOLS.get(symbol)
     if not cb_symbol:
         return []
 
-    url = (f"{COINBASE}/products/{cb_symbol}/candles"
-           f"?granularity={granularity}")
-    data = _get_json(url)
-    if not data or not isinstance(data, list):
-        return []
+    PAGE_SIZE = 300  # Coinbase max per request
+    all_bars: list[Bar] = []
+    seen_timestamps: set[float] = set()
 
-    bars = []
-    for candle in data:
-        try:
-            # Coinbase format: [time, low, high, open, close, volume]
-            bars.append(Bar(
-                timestamp=float(candle[0]),
-                open=float(candle[3]),
-                high=float(candle[2]),
-                low=float(candle[1]),
-                close=float(candle[4]),
-                volume=float(candle[5]),
-            ))
-        except (IndexError, ValueError, TypeError):
-            continue
+    # Start from now, paginate backward
+    end_ts = int(time.time())
+    remaining = limit
+    max_pages = (limit // PAGE_SIZE) + 2  # safety cap
 
-    # Coinbase returns newest first — reverse to chronological
-    bars.sort(key=lambda b: b.timestamp)
-    # Trim to requested limit
-    if len(bars) > limit:
-        bars = bars[-limit:]
-    return bars
+    for _page in range(max_pages):
+        if remaining <= 0:
+            break
+
+        # Each page covers PAGE_SIZE * granularity seconds
+        page_seconds = PAGE_SIZE * granularity
+        start_ts = end_ts - page_seconds
+
+        start_iso = datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
+
+        url = (f"{COINBASE}/products/{cb_symbol}/candles"
+               f"?granularity={granularity}&start={start_iso}&end={end_iso}")
+        data = _get_json(url)
+        if not data or not isinstance(data, list) or len(data) == 0:
+            break
+
+        page_bars = []
+        for candle in data:
+            try:
+                # Coinbase format: [time, low, high, open, close, volume]
+                ts = float(candle[0])
+                if ts in seen_timestamps:
+                    continue
+                seen_timestamps.add(ts)
+                page_bars.append(Bar(
+                    timestamp=ts,
+                    open=float(candle[3]),
+                    high=float(candle[2]),
+                    low=float(candle[1]),
+                    close=float(candle[4]),
+                    volume=float(candle[5]),
+                ))
+            except (IndexError, ValueError, TypeError):
+                continue
+
+        if not page_bars:
+            break
+
+        all_bars.extend(page_bars)
+        remaining -= len(page_bars)
+
+        # Move window backward for next page
+        end_ts = start_ts
+
+        # Rate limit courtesy
+        time.sleep(0.15)
+
+    # Sort chronologically and trim
+    all_bars.sort(key=lambda b: b.timestamp)
+    if len(all_bars) > limit:
+        all_bars = all_bars[-limit:]
+    return all_bars
 
 
 def fetch_coinbase_orderbook(symbol: str, level: int = 2) -> dict:
@@ -181,44 +217,70 @@ def fetch_coinbase_trades(symbol: str, limit: int = 100) -> list[dict]:
 def fetch_kraken_klines(symbol: str, interval: int = 60,
                          limit: int = 200) -> list[Bar]:
     """
-    Fetch OHLCV from Kraken. interval in minutes (60=1h).
-    Kraken returns up to 720 candles.
+    Fetch OHLCV from Kraken with pagination. interval in minutes (60=1h).
+    Kraken returns up to 720 candles per request and provides a "last"
+    cursor for pagination.
     """
     kr_pair = KRAKEN_SYMBOLS.get(symbol)
     if not kr_pair:
         return []
 
-    # Request data from (limit * interval_minutes * 60) seconds ago
+    all_bars: list[Bar] = []
+    seen_timestamps: set[float] = set()
+
+    # Start from (limit * interval * 60) seconds ago
     since = int(time.time()) - limit * interval * 60
-    url = f"{KRAKEN}/OHLC?pair={kr_pair}&interval={interval}&since={since}"
-    data = _get_json(url)
-    if not data or data.get("error"):
-        return []
+    max_pages = (limit // 720) + 2  # safety cap
 
-    result = data.get("result", {})
-    # Kraken returns {pair_name: [...], "last": timestamp}
-    bars = []
-    for key, candles in result.items():
-        if key == "last":
-            continue
-        for c in candles:
-            try:
-                # Kraken: [time, open, high, low, close, vwap, volume, count]
-                bars.append(Bar(
-                    timestamp=float(c[0]),
-                    open=float(c[1]),
-                    high=float(c[2]),
-                    low=float(c[3]),
-                    close=float(c[4]),
-                    volume=float(c[6]),
-                ))
-            except (IndexError, ValueError, TypeError):
+    for _page in range(max_pages):
+        if len(all_bars) >= limit:
+            break
+
+        url = f"{KRAKEN}/OHLC?pair={kr_pair}&interval={interval}&since={since}"
+        data = _get_json(url)
+        if not data or data.get("error"):
+            break
+
+        result = data.get("result", {})
+        last_cursor = result.get("last", 0)
+
+        page_count = 0
+        for key, candles in result.items():
+            if key == "last":
                 continue
+            for c in candles:
+                try:
+                    ts = float(c[0])
+                    if ts in seen_timestamps:
+                        continue
+                    seen_timestamps.add(ts)
+                    all_bars.append(Bar(
+                        timestamp=ts,
+                        open=float(c[1]),
+                        high=float(c[2]),
+                        low=float(c[3]),
+                        close=float(c[4]),
+                        volume=float(c[6]),
+                    ))
+                    page_count += 1
+                except (IndexError, ValueError, TypeError):
+                    continue
 
-    bars.sort(key=lambda b: b.timestamp)
-    if len(bars) > limit:
-        bars = bars[-limit:]
-    return bars
+        if page_count == 0:
+            break
+
+        # Use Kraken's "last" cursor for next page
+        if last_cursor and last_cursor > since:
+            since = last_cursor
+        else:
+            break
+
+        time.sleep(0.2)  # Kraken rate limit courtesy
+
+    all_bars.sort(key=lambda b: b.timestamp)
+    if len(all_bars) > limit:
+        all_bars = all_bars[-limit:]
+    return all_bars
 
 
 def fetch_kraken_orderbook(symbol: str, count: int = 20) -> dict:
@@ -413,26 +475,60 @@ def fetch_kalshi_priors(symbol: str) -> dict:
 # MULTI-SOURCE OHLCV FETCHER WITH FALLBACK CHAIN
 # ═══════════════════════════════════════════════════════════════
 
+def _merge_bar_lists(*bar_lists: list[Bar]) -> list[Bar]:
+    """
+    Merge multiple Bar lists by timestamp, preferring the first source
+    that provides data for a given timestamp.
+    """
+    seen: dict[int, Bar] = {}  # timestamp (rounded to minute) -> Bar
+    for bars in bar_lists:
+        for b in bars:
+            # Round to nearest minute to handle small timestamp differences
+            key = int(b.timestamp) // 60
+            if key not in seen:
+                seen[key] = b
+    merged = sorted(seen.values(), key=lambda b: b.timestamp)
+    return merged
+
+
 def fetch_ohlcv_bars(symbol: str, limit: int = 200) -> tuple[list[Bar], str]:
     """
-    Fetch hourly OHLCV bars using fallback chain:
-    1. Coinbase  (US-native, reliable)
-    2. Kraken    (US-accessible)
-    3. CoinGecko (limited, no volume, 4h candles for 7d)
+    Fetch hourly OHLCV bars with pagination and multi-source merging.
+
+    Strategy:
+    1. Paginate Coinbase (primary, max 300/request)
+    2. Paginate Kraken (secondary, max 720/request)
+    3. Merge both sources by timestamp for maximum coverage
+    4. Fall back to CoinGecko OHLC if both fail
 
     Returns (bars, source_name).
     """
-    # 1) Coinbase
-    bars = fetch_coinbase_klines(symbol, granularity=3600, limit=limit)
-    if len(bars) >= 20:
-        return bars, "coinbase"
+    sources_used = []
 
-    # 2) Kraken
-    bars = fetch_kraken_klines(symbol, interval=60, limit=limit)
-    if len(bars) >= 20:
-        return bars, "kraken"
+    # 1) Coinbase (paginated)
+    cb_bars = fetch_coinbase_klines(symbol, granularity=3600, limit=limit)
+    if cb_bars:
+        sources_used.append("coinbase")
+        _log(f"  Coinbase: {len(cb_bars)} bars")
 
-    # 3) CoinGecko OHLC (4h candles for 7 days ≈ 42 bars)
+    # 2) Kraken (paginated) — fetch if Coinbase didn't fill the request
+    kr_bars = []
+    if len(cb_bars) < limit:
+        kr_bars = fetch_kraken_klines(symbol, interval=60, limit=limit)
+        if kr_bars:
+            sources_used.append("kraken")
+            _log(f"  Kraken: {len(kr_bars)} bars")
+
+    # 3) Merge both sources
+    if cb_bars or kr_bars:
+        merged = _merge_bar_lists(cb_bars, kr_bars)
+        if len(merged) > limit:
+            merged = merged[-limit:]
+        source = "+".join(sources_used)
+        if len(merged) >= 20:
+            return merged, source
+
+    # 4) CoinGecko fallback (4h candles for 30 days ≈ 180 bars)
     bars = fetch_coingecko_ohlc(symbol, days=30)
     if len(bars) >= 10:
         return bars, "coingecko"
