@@ -1,0 +1,533 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>BTCUSDT Monte Carlo Simulation — 100,000 Iterations</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@3.1.0/dist/chartjs-plugin-annotation.min.js"></script>
+<style>
+:root {
+  --bg: #0d1117; --surface: #161b22; --border: #30363d;
+  --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+  --green: #3fb950; --red: #f85149; --yellow: #d29922; --purple: #bc8cff;
+  --orange: #d18616;
+}
+* { margin: 0; padding: 0; box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background: var(--bg); color: var(--text); line-height: 1.5;
+  min-height: 100vh;
+}
+.container { max-width: 1400px; margin: 0 auto; padding: 24px 16px; }
+
+/* Header */
+.header {
+  text-align: center; padding: 32px 0 24px;
+  border-bottom: 1px solid var(--border); margin-bottom: 24px;
+}
+.header h1 { font-size: 28px; font-weight: 700; margin-bottom: 4px; }
+.header .subtitle { color: var(--muted); font-size: 14px; }
+.header .symbol-badge {
+  display: inline-block; background: var(--surface); border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 20px; margin-top: 12px; font-size: 18px; font-weight: 600;
+}
+.header .direction-down { color: var(--red); }
+.header .direction-up { color: var(--green); }
+
+/* KPI Cards */
+.kpi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 12px; margin-bottom: 24px;
+}
+.kpi {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; text-align: center;
+}
+.kpi .label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); margin-bottom: 4px; }
+.kpi .value { font-size: 24px; font-weight: 700; }
+.kpi .sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+.kpi.green .value { color: var(--green); }
+.kpi.red .value { color: var(--red); }
+.kpi.accent .value { color: var(--accent); }
+.kpi.yellow .value { color: var(--yellow); }
+.kpi.purple .value { color: var(--purple); }
+
+/* Chart panels */
+.chart-grid {
+  display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px;
+}
+@media (max-width: 900px) { .chart-grid { grid-template-columns: 1fr; } }
+.panel {
+  background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+  padding: 16px; position: relative;
+}
+.panel h3 {
+  font-size: 14px; font-weight: 600; margin-bottom: 12px;
+  color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px;
+}
+.panel canvas { width: 100% !important; }
+.panel.full { grid-column: 1 / -1; }
+
+/* Stats table */
+.stats-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+}
+.stats-table th, .stats-table td {
+  padding: 8px 12px; text-align: left; border-bottom: 1px solid var(--border);
+}
+.stats-table th { color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; }
+.stats-table td:last-child { text-align: right; font-family: 'SF Mono', 'Consolas', monospace; }
+.stats-table tr:hover { background: rgba(88, 166, 255, 0.05); }
+
+/* Loading */
+.loading {
+  display: flex; align-items: center; justify-content: center; min-height: 400px;
+  flex-direction: column; gap: 16px;
+}
+.spinner {
+  width: 40px; height: 40px; border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* Footer */
+.footer {
+  text-align: center; padding: 24px 0; color: var(--muted); font-size: 12px;
+  border-top: 1px solid var(--border); margin-top: 24px;
+}
+
+/* Verdict banner */
+.verdict {
+  padding: 16px 24px; border-radius: 8px; text-align: center;
+  margin-bottom: 24px; font-size: 16px; font-weight: 600;
+}
+.verdict.bearish { background: rgba(248,81,73,0.12); border: 1px solid rgba(248,81,73,0.3); color: var(--red); }
+.verdict.bullish { background: rgba(63,185,80,0.12); border: 1px solid rgba(63,185,80,0.3); color: var(--green); }
+</style>
+</head>
+<body>
+<div class="container" id="app">
+  <div class="loading" id="loading">
+    <div class="spinner"></div>
+    <div>Loading simulation results...</div>
+  </div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const fmt = (n, d=2) => n.toLocaleString('en-US', {minimumFractionDigits: d, maximumFractionDigits: d});
+const fmtPct = (n, d=2) => n.toFixed(d) + '%';
+const fmtUSD = n => '$' + fmt(n);
+
+Chart.defaults.color = '#8b949e';
+Chart.defaults.borderColor = '#30363d';
+Chart.defaults.font.family = "-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif";
+
+async function init() {
+  const resp = await fetch('/api/results');
+  const data = await resp.json();
+  render(data);
+}
+
+function render(D) {
+  const app = $('#app');
+  const inp = D.input, trm = D.terminal, val = D.validation, rsk = D.risk, meta = D.meta;
+  const isDown = inp.direction === 'Down';
+
+  app.innerHTML = `
+    <div class="header">
+      <h1>Monte Carlo Simulation</h1>
+      <div class="subtitle">${meta.model} &mdash; ${meta.iterations.toLocaleString()} iterations &mdash; ${meta.elapsed_seconds}s</div>
+      <div class="symbol-badge">
+        ${inp.symbol || meta.symbol} &nbsp;
+        <span class="${isDown ? 'direction-down' : 'direction-up'}">${isDown ? '&#9660;' : '&#9650;'} ${inp.direction}</span>
+      </div>
+    </div>
+
+    <div class="verdict ${isDown ? 'bearish' : 'bullish'}">
+      ${val.validated ? '&#10003; VALIDATED' : '&#10007; NOT VALIDATED'} &mdash;
+      ${fmtPct(val.mc_confidence)} MC Confidence &mdash;
+      ${fmtPct(val.paths_aligned_pct)} of paths confirm ${inp.direction.toLowerCase()} movement &mdash;
+      ${fmtPct(val.quantile_range_hit_pct)} within predicted range
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi accent">
+        <div class="label">Current Price</div>
+        <div class="value">${fmtUSD(inp.current_price)}</div>
+      </div>
+      <div class="kpi ${isDown ? 'red' : 'green'}">
+        <div class="label">Predicted Price</div>
+        <div class="value">${fmtUSD(inp.predicted_price)}</div>
+        <div class="sub">${isDown ? '' : '+'}${fmtPct((inp.predicted_price/inp.current_price - 1)*100)} expected</div>
+      </div>
+      <div class="kpi ${isDown ? 'red' : 'green'}">
+        <div class="label">MC Mean</div>
+        <div class="value">${fmtUSD(trm.mean)}</div>
+        <div class="sub">&sigma; ${fmtUSD(trm.std)}</div>
+      </div>
+      <div class="kpi green">
+        <div class="label">Paths Aligned</div>
+        <div class="value">${fmtPct(val.paths_aligned_pct)}</div>
+        <div class="sub">${meta.iterations.toLocaleString()} paths</div>
+      </div>
+      <div class="kpi green">
+        <div class="label">MC Confidence</div>
+        <div class="value">${fmtPct(val.mc_confidence)}</div>
+        <div class="sub">Accuracy: ${fmtPct(val.mean_accuracy, 4)}</div>
+      </div>
+      <div class="kpi yellow">
+        <div class="label">Volatility</div>
+        <div class="value">${fmtPct(inp.volatility * 100)}</div>
+        <div class="sub">Model stated</div>
+      </div>
+      <div class="kpi red">
+        <div class="label">VaR 95%</div>
+        <div class="value">${fmtPct(rsk.var_95_pct, 2)}</div>
+        <div class="sub">CVaR: ${fmtPct(rsk.cvar_95_pct, 2)}</div>
+      </div>
+      <div class="kpi purple">
+        <div class="label">Sharpe Ratio</div>
+        <div class="value">${rsk.sharpe_ratio.toFixed(4)}</div>
+        <div class="sub">Return/Risk</div>
+      </div>
+    </div>
+
+    <div class="chart-grid">
+      <div class="panel full"><h3>Price Paths (50 sampled) with Percentile Envelope</h3><canvas id="pathChart" height="100"></canvas></div>
+      <div class="panel"><h3>Terminal Price Distribution (200 bins)</h3><canvas id="histChart" height="180"></canvas></div>
+      <div class="panel"><h3>Convergence — Running Mean</h3><canvas id="convChart" height="180"></canvas></div>
+      <div class="panel"><h3>Percentile Waterfall</h3><canvas id="pctChart" height="180"></canvas></div>
+      <div class="panel"><h3>Risk Metrics</h3><canvas id="riskChart" height="180"></canvas></div>
+    </div>
+
+    <div class="chart-grid">
+      <div class="panel">
+        <h3>Terminal Price Statistics</h3>
+        <table class="stats-table">
+          <tr><th>Metric</th><th>Value</th></tr>
+          <tr><td>Mean</td><td>${fmtUSD(trm.mean)}</td></tr>
+          <tr><td>Median</td><td>${fmtUSD(trm.median)}</td></tr>
+          <tr><td>Std Dev</td><td>${fmtUSD(trm.std)}</td></tr>
+          <tr><td>Minimum</td><td>${fmtUSD(trm.min)}</td></tr>
+          <tr><td>Maximum</td><td>${fmtUSD(trm.max)}</td></tr>
+          <tr><td>P1</td><td>${fmtUSD(trm.percentiles.p1)}</td></tr>
+          <tr><td>P5</td><td>${fmtUSD(trm.percentiles.p5)}</td></tr>
+          <tr><td>P10</td><td>${fmtUSD(trm.percentiles.p10)}</td></tr>
+          <tr><td>P25</td><td>${fmtUSD(trm.percentiles.p25)}</td></tr>
+          <tr><td>P50 (Median)</td><td>${fmtUSD(trm.percentiles.p50)}</td></tr>
+          <tr><td>P75</td><td>${fmtUSD(trm.percentiles.p75)}</td></tr>
+          <tr><td>P90</td><td>${fmtUSD(trm.percentiles.p90)}</td></tr>
+          <tr><td>P95</td><td>${fmtUSD(trm.percentiles.p95)}</td></tr>
+          <tr><td>P99</td><td>${fmtUSD(trm.percentiles.p99)}</td></tr>
+        </table>
+      </div>
+      <div class="panel">
+        <h3>Validation & Risk Summary</h3>
+        <table class="stats-table">
+          <tr><th>Metric</th><th>Value</th></tr>
+          <tr><td>Paths Aligned (${inp.direction})</td><td>${fmtPct(val.paths_aligned_pct)}</td></tr>
+          <tr><td>Quantile Range Hit</td><td>${fmtPct(val.quantile_range_hit_pct)}</td></tr>
+          <tr><td>Mean Accuracy</td><td>${fmtPct(val.mean_accuracy, 4)}</td></tr>
+          <tr><td>MC Confidence</td><td>${fmtPct(val.mc_confidence)}</td></tr>
+          <tr><td>Prediction Error</td><td>${fmtPct(val.prediction_error_pct, 4)}</td></tr>
+          <tr><td style="padding-top:16px;font-weight:600" colspan="2">Risk Metrics</td></tr>
+          <tr><td>Value at Risk (95%)</td><td>${fmtPct(rsk.var_95_pct, 4)}</td></tr>
+          <tr><td>Value at Risk (99%)</td><td>${fmtPct(rsk.var_99_pct, 4)}</td></tr>
+          <tr><td>CVaR / Expected Shortfall (95%)</td><td>${fmtPct(rsk.cvar_95_pct, 4)}</td></tr>
+          <tr><td>CVaR / Expected Shortfall (99%)</td><td>${fmtPct(rsk.cvar_99_pct, 4)}</td></tr>
+          <tr><td>Avg Max Drawdown</td><td>${fmtPct(rsk.avg_max_drawdown_pct, 4)}</td></tr>
+          <tr><td>Worst Drawdown</td><td>${fmtPct(rsk.worst_drawdown_pct, 4)}</td></tr>
+          <tr><td>Sharpe Ratio</td><td>${rsk.sharpe_ratio.toFixed(4)}</td></tr>
+          <tr><td>Mean Return</td><td>${fmtPct(rsk.mean_return_pct, 4)}</td></tr>
+          <tr><td>Std Return</td><td>${fmtPct(rsk.std_return_pct, 4)}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="footer">
+      Generated ${meta.timestamp} &mdash; Seed: ${meta.seed} &mdash;
+      ${meta.iterations.toLocaleString()} iterations &times; ${meta.steps} steps &mdash;
+      ${meta.elapsed_seconds}s compute
+    </div>
+  `;
+
+  drawPaths(D);
+  drawHistogram(D);
+  drawConvergence(D);
+  drawPercentiles(D);
+  drawRisk(D);
+}
+
+/* ── Chart: Price Paths + Envelope ────────────────────── */
+function drawPaths(D) {
+  const ctx = document.getElementById('pathChart').getContext('2d');
+  const steps = D.sampled_paths[0].length;
+  const labels = Array.from({length: steps}, (_, i) => i);
+  const datasets = [];
+
+  // Envelope fills
+  const envColors = [
+    {lo: 'p5', hi: 'p95', color: 'rgba(88,166,255,0.08)', label: 'P5–P95'},
+    {lo: 'p10', hi: 'p90', color: 'rgba(88,166,255,0.10)', label: 'P10–P90'},
+    {lo: 'p25', hi: 'p75', color: 'rgba(88,166,255,0.14)', label: 'P25–P75'},
+  ];
+  envColors.forEach(e => {
+    datasets.push({
+      label: e.label,
+      data: D.envelope[e.hi],
+      borderColor: 'transparent', backgroundColor: 'transparent',
+      pointRadius: 0, fill: false, borderWidth: 0, order: 10,
+    });
+    datasets.push({
+      label: e.label + ' fill',
+      data: D.envelope[e.lo],
+      borderColor: 'transparent', backgroundColor: e.color,
+      pointRadius: 0, fill: '-1', borderWidth: 0, order: 10,
+    });
+  });
+
+  // Median line
+  datasets.push({
+    label: 'Median (P50)',
+    data: D.envelope.p50,
+    borderColor: '#58a6ff', borderWidth: 2,
+    pointRadius: 0, fill: false, order: 2,
+  });
+
+  // Sampled paths
+  D.sampled_paths.slice(0, 50).forEach((path, i) => {
+    datasets.push({
+      label: i === 0 ? 'Sample paths' : '',
+      data: path,
+      borderColor: 'rgba(139,148,158,0.15)', borderWidth: 0.8,
+      pointRadius: 0, fill: false, order: 5,
+    });
+  });
+
+  new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets },
+    options: {
+      responsive: true,
+      interaction: { intersect: false, mode: 'index' },
+      plugins: {
+        legend: { display: false },
+        annotation: {
+          annotations: {
+            currentLine: {
+              type: 'line', yMin: D.input.current_price, yMax: D.input.current_price,
+              borderColor: '#8b949e', borderWidth: 1, borderDash: [6, 4],
+              label: { display: true, content: 'Current: $' + fmt(D.input.current_price), position: 'start', backgroundColor: 'rgba(30,30,30,0.8)', color: '#8b949e', font: { size: 11 } }
+            },
+            predictedLine: {
+              type: 'line', yMin: D.input.predicted_price, yMax: D.input.predicted_price,
+              borderColor: '#f85149', borderWidth: 1, borderDash: [6, 4],
+              label: { display: true, content: 'Predicted: $' + fmt(D.input.predicted_price), position: 'end', backgroundColor: 'rgba(30,30,30,0.8)', color: '#f85149', font: { size: 11 } }
+            }
+          }
+        }
+      },
+      scales: {
+        x: { title: { display: true, text: 'Step (half-hour intervals)' }, grid: { color: 'rgba(48,54,61,0.5)' } },
+        y: { title: { display: true, text: 'Price (USD)' }, grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { callback: v => '$' + v.toLocaleString() } }
+      }
+    }
+  });
+}
+
+/* ── Chart: Histogram ─────────────────────────────────── */
+function drawHistogram(D) {
+  const ctx = document.getElementById('histChart').getContext('2d');
+  const edges = D.histogram.edges;
+  const counts = D.histogram.counts;
+  const labels = edges.slice(0, -1).map((e, i) => ((e + edges[i+1]) / 2));
+  const maxCount = Math.max(...counts);
+
+  const colors = labels.map(p => {
+    if (p >= D.input.quantiles.q05 && p <= D.input.quantiles.q95) return 'rgba(88,166,255,0.7)';
+    return 'rgba(139,148,158,0.3)';
+  });
+
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: labels.map(l => '$' + Math.round(l).toLocaleString()),
+      datasets: [{
+        data: counts, backgroundColor: colors, borderWidth: 0,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { display: false },
+        annotation: {
+          annotations: {
+            predicted: {
+              type: 'line', xMin: null, xMax: null,
+              borderColor: '#f85149', borderWidth: 2, borderDash: [4, 4],
+            },
+            current: {
+              type: 'line',
+              borderColor: '#8b949e', borderWidth: 1, borderDash: [4, 4],
+            },
+            meanLine: {
+              type: 'line',
+              borderColor: '#3fb950', borderWidth: 2, borderDash: [4, 4],
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          display: true,
+          ticks: { maxTicksLimit: 10, font: { size: 10 } },
+          grid: { display: false },
+          title: { display: true, text: 'Terminal Price' }
+        },
+        y: {
+          title: { display: true, text: 'Frequency' },
+          grid: { color: 'rgba(48,54,61,0.5)' }
+        }
+      }
+    }
+  });
+}
+
+/* ── Chart: Convergence ───────────────────────────────── */
+function drawConvergence(D) {
+  const ctx = document.getElementById('convChart').getContext('2d');
+  const conv = D.convergence;
+
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: conv.map(c => c.n.toLocaleString()),
+      datasets: [
+        {
+          label: 'Running Mean',
+          data: conv.map(c => c.mean),
+          borderColor: '#58a6ff', borderWidth: 2, pointRadius: 0, fill: false,
+        },
+        {
+          label: 'Mean + 1\u03C3',
+          data: conv.map(c => c.mean + c.std),
+          borderColor: 'rgba(88,166,255,0.3)', borderWidth: 1, borderDash: [4,4],
+          pointRadius: 0, fill: false,
+        },
+        {
+          label: 'Mean - 1\u03C3',
+          data: conv.map(c => c.mean - c.std),
+          borderColor: 'rgba(88,166,255,0.3)', borderWidth: 1, borderDash: [4,4],
+          pointRadius: 0, fill: '-1',
+          backgroundColor: 'rgba(88,166,255,0.06)',
+        }
+      ]
+    },
+    options: {
+      responsive: true,
+      plugins: {
+        legend: { position: 'bottom', labels: { boxWidth: 12, font: { size: 11 } } },
+        annotation: {
+          annotations: {
+            target: {
+              type: 'line', yMin: D.input.predicted_price, yMax: D.input.predicted_price,
+              borderColor: '#f85149', borderWidth: 1, borderDash: [4, 4],
+              label: { display: true, content: 'Predicted', position: 'start', backgroundColor: 'rgba(30,30,30,0.8)', color: '#f85149', font: { size: 10 } }
+            }
+          }
+        }
+      },
+      scales: {
+        x: { title: { display: true, text: 'Iterations' }, ticks: { maxTicksLimit: 8 }, grid: { color: 'rgba(48,54,61,0.5)' } },
+        y: { title: { display: true, text: 'Mean Terminal Price' }, grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { callback: v => '$' + v.toLocaleString() } }
+      }
+    }
+  });
+}
+
+/* ── Chart: Percentile Waterfall ──────────────────────── */
+function drawPercentiles(D) {
+  const ctx = document.getElementById('pctChart').getContext('2d');
+  const p = D.terminal.percentiles;
+  const labels = Object.keys(p).map(k => k.toUpperCase());
+  const values = Object.values(p);
+  const colors = values.map(v => v < D.input.current_price ? 'rgba(248,81,73,0.7)' : 'rgba(63,185,80,0.7)');
+
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        data: values, backgroundColor: colors, borderWidth: 0, borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true, indexAxis: 'y',
+      plugins: {
+        legend: { display: false },
+        annotation: {
+          annotations: {
+            current: {
+              type: 'line', xMin: D.input.current_price, xMax: D.input.current_price,
+              borderColor: '#8b949e', borderWidth: 2, borderDash: [4,4],
+              label: { display: true, content: 'Current', position: 'start', backgroundColor: 'rgba(30,30,30,0.8)', color: '#8b949e', font: { size: 10 } }
+            }
+          }
+        }
+      },
+      scales: {
+        x: { ticks: { callback: v => '$' + (v/1000).toFixed(1) + 'k' }, grid: { color: 'rgba(48,54,61,0.5)' } },
+        y: { grid: { display: false } }
+      }
+    }
+  });
+}
+
+/* ── Chart: Risk Metrics ──────────────────────────────── */
+function drawRisk(D) {
+  const ctx = document.getElementById('riskChart').getContext('2d');
+  const r = D.risk;
+  const metrics = [
+    { label: 'VaR 95%', value: Math.abs(r.var_95_pct) },
+    { label: 'VaR 99%', value: Math.abs(r.var_99_pct) },
+    { label: 'CVaR 95%', value: Math.abs(r.cvar_95_pct) },
+    { label: 'CVaR 99%', value: Math.abs(r.cvar_99_pct) },
+    { label: 'Avg Max DD', value: Math.abs(r.avg_max_drawdown_pct) },
+    { label: 'Worst DD', value: Math.abs(r.worst_drawdown_pct) },
+  ];
+
+  const barColors = ['#f85149','#f85149','#d29922','#d29922','#bc8cff','#bc8cff'];
+
+  new Chart(ctx, {
+    type: 'bar',
+    data: {
+      labels: metrics.map(m => m.label),
+      datasets: [{
+        data: metrics.map(m => m.value),
+        backgroundColor: barColors.map(c => c + 'cc'),
+        borderColor: barColors,
+        borderWidth: 1, borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: { grid: { display: false } },
+        y: { title: { display: true, text: 'Magnitude (%)' }, grid: { color: 'rgba(48,54,61,0.5)' },
+          ticks: { callback: v => v.toFixed(1) + '%' } }
+      }
+    }
+  });
+}
+
+init().catch(e => {
+  document.getElementById('app').innerHTML = `<div class="loading"><div style="color:var(--red)">Error: ${e.message}</div></div>`;
+});
+</script>
+</body>
+</html>

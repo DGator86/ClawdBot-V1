@@ -1,23 +1,40 @@
 {
-  "agent": {
-    "model": "openai/gpt-4o",
-    "thinking": "medium"
+  "agents": {
+    "defaults": {
+      "workspace": "~/clawd",
+      "model": {
+        "primary": "openai/gpt-4o"
+      },
+      "thinkingDefault": "low"
+    },
+    "list": [
+      {
+        "id": "main",
+        "default": true,
+        "identity": {
+          "name": "ClawdBot",
+          "theme": "crypto trading assistant",
+          "emoji": "🤖"
+        }
+      }
+    ]
   },
   "gateway": {
+    "mode": "local",
     "port": 18789,
-    "bind": "127.0.0.1"
+    "bind": "loopback"
   },
   "channels": {
     "telegram": {
       "enabled": true,
-      "botToken": "${TELEGRAM_BOT_TOKEN}"
+      "botToken": "${TELEGRAM_BOT_TOKEN}",
+      "dmPolicy": "open",
+      "allowFrom": ["*"]
     }
   },
-  "agents": {
-    "defaults": {
-      "sandbox": {
-        "mode": "disabled"
-      }
+  "skills": {
+    "load": {
+      "extraDirs": ["./skills"]
     }
   }
 }

@@ -1,0 +1,27 @@
+# Example configuration for moltbot-repo-scout
+# Copy to config.yaml and edit as needed
+
+workspace_dir: "./workspace"  # where repos and artifacts are written
+max_repo_size_mb: 50           # skip repos larger than this on download
+file_allowlist:
+  - "**/*.py"
+  - "**/*.js"
+  - "**/*.ts"
+  - "**/*.md"
+  - "**/*.json"
+  - "**/*.yml"
+  - "**/*.yaml"
+concurrency: 4
+
+# GitHub API settings
+github:
+  token_env: "GITHUB_TOKEN"   # name of env var to pick up
+  api_base: "https://api.github.com"
+  search_sort: "stars"
+  search_order: "desc"
+
+# Suspicious patterns toggles
+scan:
+  detect_secrets: true
+  detect_suspicious: true
+  license_required: false

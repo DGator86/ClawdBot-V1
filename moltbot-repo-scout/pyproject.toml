@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moltbot-repo-scout"
+version = "0.1.0"
+description = "Static-analysis research tool that converts public trading repos into structured learning artifacts for Moltbot/OpenClaw"
+authors = [{ name = "GenSpark AI" }]
+requires-python = ">=3.11"
+readme = "README.md"
+license = { text = "MIT" }
+dependencies = [
+  "PyYAML>=6.0",
+  "requests>=2.31.0",
+]
+
+[project.scripts]
+reposcout = "moltbot_repo_scout.cli:main"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-q"
