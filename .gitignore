@@ -43,3 +43,7 @@ temp/
 *.tmp
 vps-audit.sh
 scripts/monte-carlo/results.json
+
+# Edge scanner runtime data
+data/
+data/top_picks.json

@@ -59,6 +59,7 @@ header "ClawdBot + Yoshi + Kalshi"
 step 1 "System packages"
 apt-get update -y -qq >/dev/null 2>&1
 apt-get install -y -qq curl git jq python3 python3-pip python3-venv >/dev/null 2>&1
+pip3 install cryptography numpy -q 2>/dev/null || pip3 install cryptography numpy --break-system-packages -q 2>/dev/null || true
 ok "Installed"
 
 # ================================================================
@@ -266,30 +267,45 @@ fi
 
 chmod 600 "$YOSHI_ENV" 2>/dev/null
 
-# Verify Kalshi
-if $KALSHI_CONFIGURED && $YOSHI_FOUND; then
-    cd "$YOSHI_DIR"
-    [ -f "venv/bin/activate" ] && source venv/bin/activate 2>/dev/null
+# Verify Kalshi using the standalone edge-scanner client (no Yoshi-Bot dependency)
+if $KALSHI_CONFIGURED; then
+    # Source env so KALSHI_KEY_ID and KALSHI_PRIVATE_KEY are available
     set -a; source "$YOSHI_ENV" 2>/dev/null; set +a
+    # Use the standalone scanner's built-in KalshiClient for verification
     python3 -c "
-import sys, os, importlib.util
-sys.path.insert(0, '.')
-# Direct file import to avoid __init__.py chain issues
-spec = importlib.util.spec_from_file_location('kalshi_client', os.path.join('src', 'gnosis', 'utils', 'kalshi_client.py'))
-mod = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(mod)
-KalshiClient = mod.KalshiClient
+import sys, os, re, json, time, base64
+from urllib import request
+
+# Fix PEM: env vars often store literal \\\\n
+pk = os.environ.get('KALSHI_PRIVATE_KEY', '').strip()
+if '\\\\n' in pk:
+    pk = pk.replace('\\\\n', '\\n')
+    os.environ['KALSHI_PRIVATE_KEY'] = pk
+
+key_id = os.environ.get('KALSHI_KEY_ID', '').strip()
+if not key_id or not pk:
+    print('  \\033[1;33m\\u26a0 Kalshi credentials incomplete, skipping verification\\033[0m')
+    sys.exit(0)
+
 try:
-    c = KalshiClient()
-    s = c.get_exchange_status()
-    if s:
-        print(f'  \033[0;32m✓ Kalshi CONNECTED (exchange={s.get(\"exchange_active\")}, trading={s.get(\"trading_active\")})\033[0m')
-    else:
-        print('  \033[1;33m⚠ Connected but exchange returned empty\033[0m')
+    from cryptography.hazmat.primitives.serialization import load_pem_private_key
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import padding
+    private_key = load_pem_private_key(pk.encode(), password=None)
+
+    # Sign and call exchange status
+    ts = str(int(time.time() * 1000))
+    path = '/exchange/status'
+    msg = ts + 'GET' + path
+    sig = private_key.sign(msg.encode(), padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
+    headers = {'KALSHI-ACCESS-KEY': key_id, 'KALSHI-ACCESS-SIGNATURE': base64.b64encode(sig).decode(), 'KALSHI-ACCESS-TIMESTAMP': ts}
+    req = request.Request('https://api.elections.kalshi.com/trade-api/v2' + path, headers=headers)
+    with request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read().decode())
+    print(f'  \\033[0;32m\\u2713 Kalshi CONNECTED (exchange={data.get(\"exchange_active\")}, trading={data.get(\"trading_active\")})\\033[0m')
 except Exception as e:
-    print(f'  \033[0;31m✗ Kalshi error: {e}\033[0m')
-" 2>/dev/null || warn "Could not verify (Python env)"
-    cd "$CLAWDBOT_DIR" 2>/dev/null
+    print(f'  \\033[0;31m\\u2717 Kalshi verify error: {e}\\033[0m')
+" 2>/dev/null || warn "Could not verify Kalshi (missing cryptography? Run: pip3 install cryptography)"
 fi
 
 # ================================================================
@@ -359,14 +375,13 @@ OPENAI_API_KEY=$OPENAI_API_KEY
 ENVEOF
 chmod 600 ~/.clawdbot/.env
 
-# Remove any leftover legacy config and stale state dir
+# Remove ALL leftover configs and state dirs (moltbot uses both paths)
 rm -f ~/.clawdbot/moltbot.json ~/.clawdbot/moltbot.json.bak 2>/dev/null
+rm -f ~/.moltbot/moltbot.json ~/.moltbot/moltbot.json.bak 2>/dev/null
 rm -rf /root/.moltbot 2>/dev/null  # remove old state dir that triggers doctor warnings
 
 # Generate gateway auth token
 GATEWAY_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
-# Remove any leftover legacy config to avoid migration noise
-rm -f ~/.clawdbot/moltbot.json 2>/dev/null
 
 cat > ~/.clawdbot/moltbot.json << MOLTEOF
 {
@@ -398,7 +413,6 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
       "mode": "token",
       "token": "$GATEWAY_TOKEN"
     }
-    "bind": "loopback"
   },
   "channels": {
     "telegram": {
@@ -417,7 +431,6 @@ cat > ~/.clawdbot/moltbot.json << MOLTEOF
 MOLTEOF
 chmod 700 ~/.clawdbot
 ok "~/.clawdbot/moltbot.json (token: ${GATEWAY_TOKEN:0:8}...)"
-ok "~/.clawdbot/moltbot.json"
 
 # ================================================================
 # 8. Systemd services
@@ -430,15 +443,14 @@ mkdir -p "$YOSHI_DIR/logs" 2>/dev/null || true
 # Find moltbot binary path
 MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/bin/moltbot")
 
-# Validate config (DO NOT run doctor --fix, it overwrites our token)
-echo "  Validating moltbot config..."
-cd "$CLAWDBOT_DIR"
-"$MOLTBOT_BIN" doctor --non-interactive 2>&1 | grep -E "Telegram:|Error:|Gateway" | head -5
-# Run moltbot doctor --fix to auto-migrate any remaining issues
-echo "  Validating moltbot config..."
-cd "$CLAWDBOT_DIR"
-"$MOLTBOT_BIN" doctor --fix --non-interactive 2>&1 | tail -5
-ok "Config validated"
+# Validate JSON with python (NOT moltbot doctor — it overwrites the config!)
+echo "  Validating JSON..."
+if python3 -c "import json; json.load(open('$HOME/.clawdbot/moltbot.json'))" 2>/dev/null; then
+    ok "moltbot.json: valid JSON"
+else
+    fail "moltbot.json: invalid JSON!"
+    cat ~/.clawdbot/moltbot.json
+fi
 
 cat > /etc/systemd/system/clawdbot.service << SVCEOF
 [Unit]
@@ -452,7 +464,8 @@ WorkingDirectory=$CLAWDBOT_DIR
 EnvironmentFile=$CLAWDBOT_DIR/.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
-ExecStart=$MOLTBOT_BIN gateway --port 18789
+Environment=CLAWDBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN
+ExecStart=$MOLTBOT_BIN gateway --port 18789 --token $GATEWAY_TOKEN
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -500,7 +513,7 @@ User=root
 WorkingDirectory=$CLAWDBOT_DIR
 EnvironmentFile=$YOSHI_DIR/.env
 Environment=TRADING_CORE_URL=http://127.0.0.1:8000
-ExecStart=$YOSHI_DIR/venv/bin/python3 $CLAWDBOT_DIR/scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --min-edge 3.0 --propose
+ExecStart=/usr/bin/python3 $CLAWDBOT_DIR/scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --min-edge 3.0 --propose
 Restart=always
 RestartSec=30
 StandardOutput=journal
@@ -514,14 +527,19 @@ ok "kalshi-edge-scanner.service"
 
 systemctl daemon-reload
 systemctl enable clawdbot yoshi-bridge kalshi-edge-scanner >/dev/null 2>&1
-systemctl daemon-reload
-systemctl enable clawdbot yoshi-bridge >/dev/null 2>&1
 ok "Enabled"
 
 # ================================================================
 # 9. Start
 # ================================================================
 step 9 "Starting"
+
+# Kill stale gateway processes (leftover from previous runs)
+systemctl stop clawdbot 2>/dev/null || true
+pkill -9 -f "moltbot gateway" 2>/dev/null || true
+pkill -9 -f "moltbot.*18789" 2>/dev/null || true
+fuser -k 18789/tcp 2>/dev/null || true
+sleep 1
 
 systemctl restart yoshi-bridge 2>/dev/null || true
 sleep 2
@@ -531,7 +549,6 @@ if $KALSHI_CONFIGURED; then
     systemctl restart kalshi-edge-scanner 2>/dev/null || true
 fi
 sleep 3
-sleep 4
 
 echo ""
 CS=$(systemctl is-active clawdbot 2>/dev/null || echo "dead")
@@ -559,7 +576,6 @@ if $KALSHI_CONFIGURED; then
 else
     warn "Kalshi: needs private key — edge scanner disabled"
 fi
-$KALSHI_CONFIGURED && ok "Kalshi: CONFIGURED" || warn "Kalshi: needs private key"
 
 # ================================================================
 header "DONE"
