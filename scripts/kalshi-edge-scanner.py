@@ -352,36 +352,55 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
     strike = float(strike)
 
     # ── Model probability estimate ───────────────────────
-    # If we have current price, we estimate probability that price
-    # will be above the strike at contract expiry.
-    # Simple approach: distance from strike as a z-score using
-    # recent implied vol from the market's own spread.
+    # Try ensemble forecaster first (12-paradigm), fall back to
+    # simple price-distance logistic if ensemble unavailable.
     model_prob = None
     model_source = "none"
+    forecast_meta = {}
+
+    # Determine horizon from contract expiry
+    close_time = market.get("close_time") or market.get("expiration_time") or ""
+    horizon_hours = 24.0  # default
+    if close_time:
+        try:
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            delta = exp - datetime.now(timezone.utc)
+            horizon_hours = max(1.0, delta.total_seconds() / 3600)
+        except Exception:
+            pass
 
     if current_price and current_price > 0:
-        # Distance to strike as fraction of price
-        dist = (current_price - strike) / current_price
+        # ── Try 12-paradigm ensemble first ────────────────
+        try:
+            from scripts.forecaster.bridge import get_ensemble_model_prob
+            series = market.get("series_ticker", "")
+            symbol = SYMBOL_MAP.get(series, "BTCUSDT")
+            ens_prob, ens_source, ens_meta = get_ensemble_model_prob(
+                symbol=symbol,
+                strike=strike,
+                current_price=current_price,
+                horizon_hours=horizon_hours,
+            )
+            if ens_prob is not None:
+                model_prob = ens_prob
+                model_source = ens_source
+                forecast_meta = ens_meta
+        except ImportError:
+            pass  # forecaster not available, use fallback
+        except Exception as e:
+            log(f"Ensemble forecast error for {ticker}: {e}", "WARN")
 
-        # Use market-implied vol from the spread width
-        spread = abs(yes_ask - yes_bid) / 100.0 if (yes_ask > 0 and yes_bid > 0) else 0.05
-        # Hourly vol estimate: spread gives us a rough idea
-        hourly_vol = max(spread, 0.005)  # floor at 0.5%
-
-        # For "above strike" contracts:
-        # If current price > strike, base prob is > 50%
-        # z = distance / vol (positive means price is above strike)
-        z = dist / hourly_vol if hourly_vol > 0 else 0
-
-        # Convert to probability using logistic approximation
-        # (faster than importing scipy)
-        model_prob = 1.0 / (1.0 + math.exp(-1.7 * z))
-        model_source = "price-distance"
-
-        # Adjust for momentum: if price is well above strike,
-        # increase confidence; if barely above, decrease
-        if abs(dist) < 0.001:  # very close to strike — uncertainty
-            model_prob = 0.50 + (model_prob - 0.50) * 0.5  # pull toward 50%
+        # ── Fallback: simple price-distance logistic ──────
+        if model_prob is None:
+            dist = (current_price - strike) / current_price
+            spread = abs(yes_ask - yes_bid) / 100.0 if (yes_ask > 0 and yes_bid > 0) else 0.05
+            hourly_vol = max(spread, 0.005)
+            z = dist / hourly_vol if hourly_vol > 0 else 0
+            model_prob = 1.0 / (1.0 + math.exp(-1.7 * z))
+            model_source = "price-distance"
+            if abs(dist) < 0.001:
+                model_prob = 0.50 + (model_prob - 0.50) * 0.5
 
     if model_prob is None:
         return None
@@ -481,6 +500,7 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
         "max_cost_dollars": round(
             max(1, min(MAX_CONTRACTS_DEFAULT, int(kelly_safe * 100))) * cost_cents / 100, 2
         ),
+        "forecast_meta": forecast_meta,  # ensemble details (empty dict if fallback)
     }
 
 

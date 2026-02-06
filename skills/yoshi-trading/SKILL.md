@@ -271,6 +271,91 @@ For ETH markets, change `series_ticker='KXBTC'` to `series_ticker='KXETH'`.
 
 ---
 
+## 12-Paradigm Ensemble Forecaster
+
+The ensemble forecaster combines 12 forecasting paradigms with regime gating to produce comprehensive crypto price predictions. It replaces simple price-distance estimates with distribution forecasts, regime detection, and tail risk metrics.
+
+### Run a Full Ensemble Forecast
+
+When the user asks "what's your forecast?", "predict BTC", "run the ensemble", "12-paradigm forecast":
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.engine --symbol BTCUSDT --horizon 24 --barrier 65000
+```
+
+Options:
+- `--symbol BTCUSDT` or `ETHUSDT` or `SOLUSDT`
+- `--horizon 24` (hours, default 24)
+- `--barrier 65000` (optional, Kalshi barrier strike for probability calc)
+- `--mc-iterations 100000` (Monte Carlo iterations, default 50000)
+- `--no-mc` (skip Monte Carlo for faster results)
+- `--json` (output as JSON)
+- `--output /tmp/forecast.json` (save to file)
+
+The forecast includes:
+- **Direction + confidence** (Up/Down/Flat with probability)
+- **Price distribution** (Q05 through Q95)
+- **Regime** (trend_up, range, cascade_risk, etc.) with probabilities
+- **Risk metrics** (VaR, CVaR, jump/crash probabilities)
+- **Barrier probability** (for Kalshi contracts)
+- **Per-module breakdown** showing which paradigms agree/disagree
+
+### Run a Quick Forecast (no MC)
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.engine --symbol BTCUSDT --no-mc
+```
+
+### Get Barrier Probability for Kalshi
+
+```bash
+cd /root/ClawdBot-V1 && python3 -c "
+import sys; sys.path.insert(0, '.')
+from scripts.forecaster.engine import Forecaster
+fc = Forecaster(mc_iterations=50000)
+r = fc.forecast('BTCUSDT', horizon_hours=24, barrier_strike=65000)
+print(f'P(BTC >= \$65000): {r.barrier_above_prob:.1%}')
+print(f'Regime: {r.regime}')
+print(f'Predicted: \${r.predicted_price:,.2f}')
+print(f'Volatility: {r.volatility:.4f}')
+print(f'Jump risk: {r.jump_prob:.1%}')
+"
+```
+
+### Fetch Live Market Data Snapshot
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.data --symbol BTCUSDT
+```
+
+### Run Walk-Forward Backtest
+
+When the user asks about performance, backtest, or evaluation:
+
+```bash
+cd /root/ClawdBot-V1 && python3 -m scripts.forecaster.evaluation --symbol BTCUSDT --bars 1000 --max-forecasts 30
+```
+
+### The 12 Paradigms
+
+The ensemble combines:
+1. **Technical features** — trend, mean-reversion, volatility regime, volume
+2. **Classical stats** — EWMA vol (GARCH-like), Kalman trend, regime switching
+3. **Macro factors** — cross-asset betas (SPX, DXY, Gold), crypto residual
+4. **Derivatives** — Leverage Fragility Index (LFI), funding, OI, tail risk
+5. **Microstructure** — order flow imbalance, trade imbalance, liquidity
+6. **On-chain** — MVRV, exchange flows (slow cycle priors)
+7. **Sentiment** — Fear & Greed, social volume (contrarian extremes)
+8. **Meta-learner** — confidence-weighted combination of all modules
+9. **Sequence model** — quantile regression on recent price sequences
+10. **Regime detector** — classifies market state and sets gating weights
+11. **Monte Carlo** — regime-conditioned jump-diffusion simulation
+12. **Crowd priors** — Kalshi implied probabilities as sanity checks
+
+**Edge Scanner Integration**: The ensemble automatically provides model_prob to the Kalshi edge scanner when available, replacing the simple logistic estimate with a distribution-based barrier probability.
+
+---
+
 ## Reading Yoshi's Scanner Signals
 
 Check for recent signals:

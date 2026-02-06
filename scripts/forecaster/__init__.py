@@ -1,0 +1,26 @@
+"""
+Crypto Forecasting Engine — 12 Paradigm Ensemble
+=================================================
+Modular ensemble forecaster implementing all major crypto prediction paradigms:
+
+1. Technical feature generators (trend, mean-reversion, vol regime, volume)
+2. Classical stats (GARCH vol, Kalman trend, regime-switching)
+3. Macro/cross-asset factor residualization
+4. Derivatives positioning (LFI, funding, OI, tail risk)
+5. Microstructure/order flow (OFI, trade imbalance, liquidity)
+6. On-chain slow priors (cycle/risk context)
+7. Sentiment/attention modulators
+8. Tabular ML meta-learner (walk-forward GBM)
+9. Deep sequence model (quantile predictor)
+10. Regime state machine + gating policy
+11. Monte Carlo envelope generator (regime-conditioned)
+12. Crowd/prediction-market implied priors
+
+Usage:
+    from scripts.forecaster import Forecaster
+    fc = Forecaster()
+    result = fc.forecast("BTCUSDT", horizon_hours=24)
+"""
+from .engine import Forecaster, ForecastResult
+
+__all__ = ["Forecaster", "ForecastResult"]

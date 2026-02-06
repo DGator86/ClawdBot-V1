@@ -47,3 +47,5 @@ scripts/monte-carlo/results.json
 # Edge scanner runtime data
 data/
 data/top_picks.json
+scripts/__pycache__/
+**/__pycache__/
