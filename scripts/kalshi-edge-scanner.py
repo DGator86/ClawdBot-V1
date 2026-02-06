@@ -77,6 +77,8 @@ def log(msg: str, level: str = "INFO"):
 
 
 # ── .env loader ──────────────────────────────────────────
+# Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
+_FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
 
 def _source_env(path: str):
@@ -85,9 +87,6 @@ def _source_env(path: str):
     KALSHI_PRIVATE_KEY is force-overwritten because systemd's
     EnvironmentFile truncates multi-line values to one line.
     """
-    # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
-    FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
-    
     try:
         with open(path) as f:
             for raw in f:
@@ -111,7 +110,7 @@ def _source_env(path: str):
                 else:
                     val = val.strip('"').strip("'")
                 if key and val:
-                    if key in FORCE_OVERWRITE_KEYS:
+                    if key in _FORCE_OVERWRITE_KEYS:
                         os.environ[key] = val  # overwrite systemd's truncated value
                     else:
                         os.environ.setdefault(key, val)

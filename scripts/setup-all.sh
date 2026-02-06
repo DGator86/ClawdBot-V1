@@ -367,55 +367,71 @@ rm -rf /root/.moltbot 2>/dev/null  # remove old state dir that triggers doctor w
 # Generate gateway auth token
 GATEWAY_TOKEN=$(openssl rand -hex 32 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(32))")
 
-# Load allowlist from environment or use a secure default
-TELEGRAM_ALLOWLIST="${TELEGRAM_ALLOWLIST:-}"
+# Build allowFrom list safely with Python
+python3 << 'PYEOF' > ~/.clawdbot/moltbot.json
+import json, os
 
-cat > ~/.clawdbot/moltbot.json << MOLTEOF
-{
-  "agents": {
-    "defaults": {
-      "workspace": "~/clawd",
-      "model": {
-        "primary": "openai/gpt-4o"
-      },
-      "thinkingDefault": "low"
+gateway_token = os.environ.get("GATEWAY_TOKEN", "")
+telegram_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+telegram_allowlist = os.environ.get("TELEGRAM_ALLOWLIST", "").strip()
+clawdbot_dir = os.environ.get("CLAWDBOT_DIR", "")
+
+# Parse allowlist safely
+if telegram_allowlist:
+    allow_from = [x.strip() for x in telegram_allowlist.split(",") if x.strip()]
+else:
+    allow_from = []
+
+config = {
+    "agents": {
+        "defaults": {
+            "workspace": "~/clawd",
+            "model": {
+                "primary": "openai/gpt-4o"
+            },
+            "thinkingDefault": "low"
+        },
+        "list": [
+            {
+                "id": "main",
+                "default": True,
+                "identity": {
+                    "name": "ClawdBot",
+                    "theme": "crypto trading assistant",
+                    "emoji": "🤖"
+                }
+            }
+        ]
     },
-    "list": [
-      {
-        "id": "main",
-        "default": true,
-        "identity": {
-          "name": "ClawdBot",
-          "theme": "crypto trading assistant",
-          "emoji": "🤖"
+    "gateway": {
+        "mode": "local",
+        "port": 18789,
+        "bind": "loopback",
+        "auth": {
+            "mode": "token",
+            "token": gateway_token
         }
-      }
-    ]
-  },
-  "gateway": {
-    "mode": "local",
-    "port": 18789,
-    "bind": "loopback",
-    "auth": {
-      "mode": "token",
-      "token": "$GATEWAY_TOKEN"
+    },
+    "channels": {
+        "telegram": {
+            "enabled": True,
+            "botToken": telegram_token,
+            "dmPolicy": "open",
+            "allowFrom": allow_from
+        }
+    },
+    "skills": {
+        "load": {
+            "extraDirs": [clawdbot_dir + "/skills"]
+        }
     }
-  },
-  "channels": {
-    "telegram": {
-      "enabled": true,
-      "botToken": "$TELEGRAM_BOT_TOKEN",
-      "dmPolicy": "open",
-      "allowFrom": $(if [ -n "$TELEGRAM_ALLOWLIST" ]; then echo "[\"$(echo $TELEGRAM_ALLOWLIST | sed 's/,/\",\"/g')\"]"; else echo "[]"; fi)
-    }
-  },
-  "skills": {
-    "load": {
-      "extraDirs": ["$CLAWDBOT_DIR/skills"]
-    }
-  }
 }
-MOLTEOF
+
+json.dump(config, open(os.path.expanduser("~/.clawdbot/moltbot.json"), "w"), indent=2)
+PYEOF
+
+export GATEWAY_TOKEN TELEGRAM_BOT_TOKEN TELEGRAM_ALLOWLIST CLAWDBOT_DIR
+
 chmod 700 ~/.clawdbot
 ok "~/.clawdbot/moltbot.json (token: ${GATEWAY_TOKEN:0:8}...)"
 

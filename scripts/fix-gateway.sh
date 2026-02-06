@@ -97,9 +97,9 @@ content = open(envfile).read()
 import re
 def fix_pem(m):
     val = m.group(1)
-    # Replace literal \\\\n with real newlines (double backslash)
+    # Replace literal \\\\n (four-char sequence: backslash backslash n) with real newlines
     val = val.replace('\\\\n', '\n')
-    # Also handle cases where it's just \\n (single backslash)
+    # Also handle cases where it's just \\n (three-char sequence: backslash n)
     val = val.replace('\\n', '\n')
     return 'KALSHI_PRIVATE_KEY=\"' + val + '\"'
 content = re.sub(r'KALSHI_PRIVATE_KEY=\"(.+?)\"', fix_pem, content, flags=re.DOTALL)
