@@ -346,6 +346,17 @@ class Forecaster:
 
         # ── Step 3: Compute and apply gating weights ──────
         gating_weights = self.regime_detector.compute_weights(regime_probs)
+
+        # Zero-out weights for modules with no actual data input.
+        # If a module reports very low confidence (≤ 0.15) it means
+        # it had no real data to work with (e.g. derivatives: 0/2,
+        # macro: 0 items, onchain: empty).  Giving these weight just
+        # pollutes the ensemble with priors that look like signal.
+        _NO_DATA_THRESHOLD = 0.15
+        for out in module_outputs:
+            if out.confidence <= _NO_DATA_THRESHOLD:
+                gating_weights[out.module_name] = 0.0
+
         result.gating_weights = {
             k: round(v, 4) for k, v in gating_weights.items()
         }
@@ -457,6 +468,8 @@ class Forecaster:
                     "original_dir_prob": round(gate_decision.original_direction_prob, 4),
                     "gated_dir_prob": round(gate_decision.gated_direction_prob, 4),
                     "multiplier": round(gate_decision.confidence_multiplier, 4),
+                    "ev_edge": round(gate_decision.ev_edge, 4),
+                    "min_ev_required": round(gate_decision.min_ev_required, 4),
                 }
             except Exception as e:
                 result.module_outputs["regime_gate"] = {"error": str(e)}
@@ -586,13 +599,18 @@ class Forecaster:
                  symbol: str = "BTCUSDT",
                  horizon_hours: float = 24.0,
                  barrier_strike: Optional[float] = None,
+                 bars_limit: int = 2000,
                  ) -> ForecastResult:
         """
         Auto-fetch market data and run the ensemble.
-        Requires the data module to be available.
+
+        bars_limit: Number of 1h bars to fetch.  Defaults to 2000
+        (~83 days) to match diagnostic back-test conditions.  Using
+        fewer bars (e.g. 200) gives the engine a different data
+        distribution than the one diagnostics validated against.
         """
         from .data import fetch_market_snapshot
-        snap = fetch_market_snapshot(symbol)
+        snap = fetch_market_snapshot(symbol, bars_limit=bars_limit)
         return self.forecast_from_snapshot(
             snap, horizon_hours, barrier_strike
         )
@@ -665,6 +683,8 @@ def main():
                         help="Monte Carlo iterations (default: 50000)")
     parser.add_argument("--mc-steps", type=int, default=48,
                         help="Monte Carlo steps (default: 48)")
+    parser.add_argument("--bars", type=int, default=2000,
+                        help="Number of 1h bars to fetch (default: 2000)")
     parser.add_argument("--no-mc", action="store_true",
                         help="Disable Monte Carlo simulation")
     parser.add_argument("--json", action="store_true",
@@ -688,6 +708,7 @@ def main():
         symbol=args.symbol,
         horizon_hours=args.horizon,
         barrier_strike=args.barrier,
+        bars_limit=args.bars,
     )
 
     if args.json:
@@ -764,8 +785,12 @@ def _print_report(r: ForecastResult):
             orig = info.get("original_dir_prob", 0.5)
             gated = info.get("gated_dir_prob", 0.5)
             mult = info.get("multiplier", 1.0)
+            ev = info.get("ev_edge", 0.0)
+            min_ev = info.get("min_ev_required", 0.04)
+            ev_ok = "✓" if ev >= min_ev else "✗"
             print(f"    {name:20s} {action:>8s} tier={tier} "
-                  f"dir: {orig:.3f}→{gated:.3f} mult={mult:.2f}")
+                  f"dir: {orig:.3f}→{gated:.3f} mult={mult:.2f} "
+                  f"EV={ev:.3f}{ev_ok}(min={min_ev:.3f})")
         elif name in ("particle_candle", "manifold_pattern"):
             # Show pattern-specific info
             conf = info.get("confidence", 0)

@@ -11,10 +11,10 @@ Solution:
    X bots achieving 95%+ win rates on Kalshi/Polymarket lags)
 
 Regime performance from diagnostics (2000-bar, 75-forecast backtest):
-  - trend_up:    HR=66.7% (n=3)  — too few samples, unreliable
-  - range:       HR=41.8% (n=55) — anti-predictive, GATE THIS
-  - trend_down:  HR=~50%  (n=~10) — no edge
-  - post_jump:   HR=60-80% (mid-sample) — real edge, BOOST THIS
+  - trend_up:    HR=0%    (n=5)  — fully anti-predictive, BLOCK + INVERT
+  - range:       HR=46.2% (n=52) — anti-predictive, BLOCK
+  - trend_down:  HR=58.3% (n=12) — only regime with edge
+  - post_jump:   HR=50%   (n=6)  — coin flip, no edge
 
 Usage:
     from scripts.forecaster.regime_gate import (
@@ -61,27 +61,27 @@ class RegimeProfile:
 DEFAULT_REGIME_PROFILES = {
     Regime.TREND_UP: RegimeProfile(
         name="trend_up",
-        tier="weak",             # Too few samples (n=3) to be confident
-        observed_hr=0.667,
-        n_samples=3,
-        confidence_multiplier=0.85,
-        min_confidence_to_trade=0.55,
-        notes="Potentially strong but n=3 is unreliable",
+        tier="blocked",          # HR=0% (n=5) — fully anti-predictive
+        observed_hr=0.00,
+        n_samples=5,
+        confidence_multiplier=0.30,  # heavy dampening
+        min_confidence_to_trade=0.65,
+        notes="Anti-predictive (0/5). Signal is INVERTED in this regime.",
     ),
     Regime.TREND_DOWN: RegimeProfile(
         name="trend_down",
-        tier="weak",
-        observed_hr=0.50,
-        n_samples=10,
-        confidence_multiplier=0.75,
-        min_confidence_to_trade=0.55,
-        notes="No clear edge in backtest",
+        tier="strong",           # HR=58.3% (n=12) — only edge regime
+        observed_hr=0.583,
+        n_samples=12,
+        confidence_multiplier=1.05,  # slight boost
+        min_confidence_to_trade=0.52,
+        notes="Best regime. Only regime with statistical edge.",
     ),
     Regime.RANGE: RegimeProfile(
         name="range",
-        tier="blocked",          # HR=41.8% is anti-predictive
-        observed_hr=0.418,
-        n_samples=55,
+        tier="blocked",          # HR=46.2% (n=52) — anti-predictive
+        observed_hr=0.462,
+        n_samples=52,
         confidence_multiplier=0.50,
         min_confidence_to_trade=0.60,  # Very high bar to trade
         notes="Anti-predictive. Direction signals should be dampened.",
@@ -97,12 +97,12 @@ DEFAULT_REGIME_PROFILES = {
     ),
     Regime.POST_JUMP: RegimeProfile(
         name="post_jump",
-        tier="strong",
-        observed_hr=0.65,
-        n_samples=8,
-        confidence_multiplier=1.10,
-        min_confidence_to_trade=0.52,
-        notes="Best regime for directional trading",
+        tier="weak",             # HR=50% (n=6) — coin flip
+        observed_hr=0.50,
+        n_samples=6,
+        confidence_multiplier=0.75,
+        min_confidence_to_trade=0.55,
+        notes="Coin flip. Not enough edge to trade confidently.",
     ),
     Regime.CASCADE_RISK: RegimeProfile(
         name="cascade_risk",
@@ -142,17 +142,27 @@ class RegimeGate:
     """
     Gates forecast outputs based on regime quality.
 
-    Applies three operations:
+    Applies four operations:
     1. Confidence dampening for weak/blocked regimes
-    2. Direction clamping toward 0.50 in anti-predictive regimes
-    3. Trade/no-trade decision based on gated confidence
+    2. Signal inversion for anti-predictive regimes (HR < 30%)
+    3. EV threshold: only trade when p_correct > breakeven
+    4. Trade/no-trade decision based on gated confidence
 
     The gate modifies PredictionTargets in-place and returns a
     GateDecision with the action and reasoning.
     """
 
-    def __init__(self, profiles: dict[Regime, RegimeProfile] = None):
+    # Default Kalshi fee structure: ~7% round-trip on 50c contracts.
+    # Breakeven p_correct = 1 / (2 - fee_pct) ≈ 0.517 for 3.4% fee,
+    # but we add margin → 0.54 minimum.  This is the MINIMUM
+    # directional probability (distance from 0.50) required to trade.
+    DEFAULT_MIN_EV_EDGE = 0.04   # |dir_prob - 0.50| must exceed this
+
+    def __init__(self, profiles: dict[Regime, RegimeProfile] = None,
+                 min_ev_edge: float = None):
         self.profiles = profiles or DEFAULT_REGIME_PROFILES
+        self.min_ev_edge = min_ev_edge if min_ev_edge is not None \
+            else self.DEFAULT_MIN_EV_EDGE
         # Track live performance to update profiles
         self._live_hits: dict[str, list[bool]] = {}
 
@@ -181,29 +191,47 @@ class RegimeGate:
         # Clamp
         targets.direction_prob = max(0.05, min(0.95, targets.direction_prob))
 
-        # ── Step 2: Blocked regime dampening ───────────────
+        # ── Step 2: Anti-predictive regime handling ─────────
         if profile.tier == "blocked":
-            # For anti-predictive regimes, aggressively shrink toward 0.50
-            dampen = 0.60  # 60% shrinkage
+            # For regimes where the model is anti-predictive,
+            # invert the signal if HR < 30% (reliably wrong = usable),
+            # otherwise dampen toward 0.50.
+            if profile.observed_hr < 0.30:
+                # INVERT: model is reliably wrong, flip the direction
+                targets.direction_prob = 1.0 - targets.direction_prob
+                targets.expected_return = -targets.expected_return
+                # Then dampen the inverted signal (don't fully trust it)
+                dampen = 0.40  # 40% shrinkage on inverted signal
+            else:
+                # DAMPEN: model is noisy but not reliably wrong
+                dampen = 0.60  # 60% shrinkage
             targets.direction_prob = (
                 targets.direction_prob * (1 - dampen) + 0.50 * dampen
             )
             # Also shrink expected return
             targets.expected_return *= (1 - dampen * 0.7)
 
-        # ── Step 3: Trade decision ─────────────────────────
+        # ── Step 3: EV threshold + trade decision ──────────
         final_confidence = abs(targets.direction_prob - 0.50)
         min_conf_distance = abs(profile.min_confidence_to_trade - 0.50)
 
-        should_trade = final_confidence >= min_conf_distance
+        # Must clear BOTH the regime-specific threshold AND the EV edge
+        should_trade = (final_confidence >= min_conf_distance
+                        and final_confidence >= self.min_ev_edge)
 
         # Blocked regimes need extra justification
         if profile.tier == "blocked" and final_confidence < 0.10:
             should_trade = False
 
-        action = "trade" if should_trade else "skip"
-        if profile.tier == "blocked":
+        # Only allow trading in regimes with enough samples and
+        # demonstrated edge.  This is the selectivity constraint:
+        # fewer trades, only when p_correct is meaningfully > breakeven.
+        if profile.tier not in ("strong",) and not should_trade:
+            action = "skip"
+        elif profile.tier == "blocked":
             action = "skip" if not should_trade else "trade_cautious"
+        else:
+            action = "trade" if should_trade else "skip"
 
         return GateDecision(
             action=action,
@@ -212,6 +240,8 @@ class RegimeGate:
             original_direction_prob=original_dir_prob,
             gated_direction_prob=targets.direction_prob,
             confidence_multiplier=profile.confidence_multiplier,
+            ev_edge=round(final_confidence, 4),
+            min_ev_required=round(self.min_ev_edge, 4),
             reason=profile.notes,
         )
 
@@ -252,6 +282,8 @@ class GateDecision:
     original_direction_prob: float = 0.50
     gated_direction_prob: float = 0.50
     confidence_multiplier: float = 1.0
+    ev_edge: float = 0.0              # |dir_prob - 0.50| after gating
+    min_ev_required: float = 0.04     # minimum edge to trade
     reason: str = ""
 
 
