@@ -1562,7 +1562,11 @@ class MonteCarloModule:
         # ── GBM with jump diffusion ──────────────────────
         # dS/S = mu*dt + sigma*dW + J*dN
         # where N ~ Poisson(lambda*dt), J ~ Normal(mu_j, sigma_j)
-        jump_lambda = jump_prob * n_steps  # expected jumps per horizon
+        # jump_prob is a per-horizon probability (e.g. 5% = 0.05 expected
+        # jumps in 24 h).  Do NOT multiply by n_steps — that converts a
+        # probability into a rate n_steps× too large and makes jump variance
+        # dominate the simulation (was VaR(95%) ≈ -21%, now ≈ -4%).
+        jump_lambda = jump_prob                    # expected jumps per horizon
         jump_mu = -0.02 if crash_prob > jump_prob * 0.4 else 0.0  # negative skew
         # Jump sizes use raw vol (not scaled) to preserve tail accuracy
         jump_sigma = sigma_raw * 1.5  # jumps are 1.5x normal vol (tightened from 2x)
