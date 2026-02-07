@@ -1,8 +1,17 @@
+# Moltbot Configuration — AI Trade Planning Orchestrator
+# ========================================================
+# Environment-aware: model and endpoint are auto-detected:
+#   GenSpark sandbox → gpt-5 via proxy
+#   VPS with OPENAI_API_KEY → gpt-4o-mini via api.openai.com
+#   Custom → uses OPENAI_BASE_URL env var
+#
+# To override, set explicit values below.
+
 ai:
   provider: openai
-  model: gpt-5
+  # model: auto-detected (gpt-5 in sandbox, gpt-4o-mini on VPS)
+  # endpoint: auto-detected (GenSpark proxy or api.openai.com)
   api_key_env: OPENAI_API_KEY
-  endpoint: https://www.genspark.ai/api/llm_proxy/v1/chat/completions
   timeout_seconds: 60
   system_prompt: >
     You are Moltbot, the reasoning core of a dual-bot crypto trading system.

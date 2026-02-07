@@ -1,15 +1,17 @@
 """
 LLM Client — Unified interface for OpenAI-compatible API calls.
 ================================================================
-Supports:
-  - GenSpark proxy (gpt-5 via ~/.genspark_llm.yaml)
-  - Direct OpenAI API
-  - Stub/local fallback for testing without API keys
+Environment-aware routing:
+  1. GenSpark sandbox — uses ~/.genspark_llm.yaml (gpt-5 via proxy)
+  2. VPS / direct OpenAI — uses OPENAI_API_KEY env var (gpt-4o)
+  3. Custom endpoint — uses OPENAI_API_KEY + OPENAI_BASE_URL env vars
+  4. Offline / no key — falls back to deterministic StubLLM
 
-The client loads credentials from:
-  1. ~/.genspark_llm.yaml (preferred, auto-configured in sandbox)
-  2. OPENAI_API_KEY + OPENAI_BASE_URL env vars
-  3. Falls back to StubLLM for offline operation
+Detection order:
+  a) ~/.genspark_llm.yaml with a RESOLVED api_key → GenSpark proxy
+  b) OPENAI_API_KEY env var (or .env file) + OPENAI_BASE_URL → custom
+  c) OPENAI_API_KEY env var (sk-*) without BASE_URL → direct OpenAI
+  d) No key anywhere → stub mode
 """
 from __future__ import annotations
 
@@ -21,53 +23,177 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib import request, error
 
+# ── Constants ──────────────────────────────────────────────────
+GENSPARK_PROXY_URL = "https://www.genspark.ai/api/llm_proxy/v1"
+OPENAI_DIRECT_URL = "https://api.openai.com/v1"
+
+# Models per environment
+GENSPARK_MODEL = "gpt-5"        # GenSpark proxy supports gpt-5 family
+OPENAI_MODEL = "gpt-4o-mini"    # Cost-effective default for direct OpenAI
+
+
+_PLACEHOLDER_PREFIXES = ("your_", "replace", "REPLACE", "xxx", "changeme", "TODO")
+
+
+def _is_placeholder(value: str) -> bool:
+    """Check if a value looks like a placeholder rather than a real secret."""
+    if not value:
+        return True
+    for prefix in _PLACEHOLDER_PREFIXES:
+        if value.startswith(prefix):
+            return True
+    if value.startswith("${") and value.endswith("}"):
+        return True  # Unresolved template
+    return False
+
+
+def _load_dotenv(path: str = None) -> dict:
+    """Load key=value pairs from a .env file (no shell expansion).
+
+    Skips placeholder values like 'your_openai_api_key_here'.
+
+    Looks in these locations (first found wins):
+      1. Explicit path argument
+      2. .env in current working directory
+      3. .env next to this source file's project root
+      4. /root/ClawdBot-V1/.env  (VPS standard location)
+    """
+    candidates = []
+    if path:
+        candidates.append(path)
+    candidates.extend([
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__)))), ".env"),
+        "/root/ClawdBot-V1/.env",
+    ])
+
+    for p in candidates:
+        if os.path.isfile(p):
+            env = {}
+            try:
+                with open(p) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\"")
+                            if not _is_placeholder(v):
+                                env[k] = v
+            except Exception:
+                pass
+            if env:  # Only return if we found real values
+                return env
+    return {}
+
 
 @dataclass
 class LLMConfig:
     """Configuration for the LLM client."""
-    model: str = "gpt-5"
+    model: str = ""             # Empty → auto-detect
     api_key: str = ""
-    base_url: str = "https://www.genspark.ai/api/llm_proxy/v1"
+    base_url: str = ""          # Empty → auto-detect
     timeout_seconds: int = 60
     max_tokens: int = 4096
     temperature: float = 0.2
     # Retry settings
     max_retries: int = 2
     retry_delay_seconds: float = 1.0
+    # Metadata: which environment was detected
+    _environment: str = "unknown"
 
     @classmethod
     def from_yaml(cls, path: str = None) -> "LLMConfig":
-        """Load config from ~/.genspark_llm.yaml or given path."""
-        if path is None:
-            path = os.path.join(os.path.expanduser("~"), ".genspark_llm.yaml")
+        """Load config with full environment detection.
 
+        Priority:
+          1. ~/.genspark_llm.yaml with resolved API key → GenSpark proxy
+          2. OPENAI_API_KEY + OPENAI_BASE_URL env vars → custom endpoint
+          3. OPENAI_API_KEY (sk-*) without BASE_URL → direct OpenAI (api.openai.com)
+          4. .env file as fallback for env vars
+          5. No key → stub mode
+        """
         config = cls()
 
-        if os.path.exists(path):
+        # ── Try GenSpark YAML ──────────────────────────────────
+        yaml_path = path or os.path.join(os.path.expanduser("~"), ".genspark_llm.yaml")
+        genspark_key = ""
+        genspark_url = ""
+
+        if os.path.exists(yaml_path):
             try:
                 import yaml
-                with open(path) as f:
+                with open(yaml_path) as f:
                     raw = yaml.safe_load(f) or {}
                 openai_cfg = raw.get("openai", {}) or {}
                 api_key_raw = openai_cfg.get("api_key", "")
+
                 # Handle ${GENSPARK_TOKEN} template
                 if api_key_raw.startswith("${") and api_key_raw.endswith("}"):
                     env_var = api_key_raw[2:-1]
-                    config.api_key = os.environ.get(env_var, "")
-                else:
-                    config.api_key = api_key_raw
-                config.base_url = openai_cfg.get("base_url", config.base_url)
+                    genspark_key = os.environ.get(env_var, "")
+                elif api_key_raw and not api_key_raw.startswith("$"):
+                    # Literal key in YAML (actually resolved)
+                    genspark_key = api_key_raw
+
+                genspark_url = openai_cfg.get("base_url", GENSPARK_PROXY_URL)
             except Exception:
                 pass
 
-        # Fall back to env vars
-        if not config.api_key:
-            config.api_key = os.environ.get("OPENAI_API_KEY", "")
-        if not config.base_url or config.base_url == cls.base_url:
-            env_url = os.environ.get("OPENAI_BASE_URL", "")
-            if env_url:
-                config.base_url = env_url
+        # If GenSpark YAML has a real key, use it
+        if genspark_key and genspark_key.startswith("gsk-"):
+            config.api_key = genspark_key
+            config.base_url = genspark_url or GENSPARK_PROXY_URL
+            config.model = GENSPARK_MODEL
+            config._environment = "genspark"
+            return config
 
+        # ── Try environment variables ──────────────────────────
+        env_key = os.environ.get("OPENAI_API_KEY", "")
+        env_url = os.environ.get("OPENAI_BASE_URL", "")
+
+        # ── Try .env file fallback ─────────────────────────────
+        if not env_key:
+            dotenv = _load_dotenv()
+            env_key = dotenv.get("OPENAI_API_KEY", "")
+            if not env_url:
+                env_url = dotenv.get("OPENAI_BASE_URL", "")
+
+        if env_key:
+            config.api_key = env_key
+
+            if env_url:
+                # Explicit base URL → custom endpoint; keep user's model choice
+                config.base_url = env_url
+                config.model = config.model or OPENAI_MODEL
+                config._environment = "custom"
+            elif env_key.startswith("sk-"):
+                # OpenAI key without explicit URL → route to api.openai.com
+                config.base_url = OPENAI_DIRECT_URL
+                config.model = OPENAI_MODEL
+                config._environment = "openai_direct"
+            else:
+                # Non-sk key without URL → could be GenSpark token set via env
+                config.base_url = GENSPARK_PROXY_URL
+                config.model = GENSPARK_MODEL
+                config._environment = "genspark_env"
+
+            return config
+
+        # If genspark YAML existed but had an unresolved template → still try it
+        # (the proxy might accept the request in certain sandbox setups)
+        if genspark_url:
+            config.api_key = genspark_key  # may be empty
+            config.base_url = genspark_url
+            config.model = GENSPARK_MODEL
+            config._environment = "genspark_unresolved"
+            return config
+
+        # ── No key found anywhere ──────────────────────────────
+        config._environment = "stub"
         return config
 
     @property
@@ -88,15 +214,20 @@ class LLMResponse:
 
 
 class LLMClient:
-    """Unified LLM client with fallback to stub."""
+    """Unified LLM client with environment-aware routing and stub fallback."""
 
     def __init__(self, config: LLMConfig = None):
         self.config = config or LLMConfig.from_yaml()
         self._use_stub = not self.config.is_configured
 
+        import sys
         if self._use_stub:
-            import sys
-            print("[LLM] No API key found; using stub responses", file=sys.stderr)
+            print(f"[LLM] No API key found; using stub responses "
+                  f"(env={self.config._environment})", file=sys.stderr)
+        else:
+            print(f"[LLM] Configured: env={self.config._environment}, "
+                  f"model={self.config.model}, "
+                  f"base_url={self.config.base_url[:50]}...", file=sys.stderr)
 
     def chat(
         self,
@@ -213,6 +344,7 @@ class LLMClient:
                     err_body = e.read().decode("utf-8")
                 except Exception:
                     pass
+                # Retry on transient errors
                 if attempt < self.config.max_retries and e.code in (429, 500, 502, 503):
                     time.sleep(self.config.retry_delay_seconds * (attempt + 1))
                     continue
@@ -256,7 +388,8 @@ class LLMClient:
             "extrapolations": [],
             "next_steps": [
                 "Configure LLM API key for full reasoning capabilities",
-                "Check ~/.genspark_llm.yaml or set OPENAI_API_KEY env var",
+                "Option 1: Set OPENAI_API_KEY in .env or environment",
+                "Option 2: Inject key via GenSpark UI → ~/.genspark_llm.yaml",
             ],
             "is_stub": True,
         }
