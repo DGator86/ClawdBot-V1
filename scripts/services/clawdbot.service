@@ -18,6 +18,10 @@ ExecStartPre=/bin/sleep 1
 # Rebuild config from env vars before each start (picks up token changes)
 ExecStartPre=/usr/bin/python3 /root/ClawdBot-V1/scripts/rebuild-config.py --quiet
 
+# Ultimate-fix: Run diagnostics + auto-fix + calibration on start
+# Uses reduced bars/forecasts for quick boot (full diagnostics via cron)
+ExecStartPre=-/usr/bin/python3 -m scripts.forecaster.diagnose --bars 500 --forecasts 20 --auto-fix --output /root/ClawdBot-V1/data/diagnostics_report.json
+
 # Start moltbot gateway
 ExecStart=/usr/local/bin/moltbot gateway --port 18789
 
