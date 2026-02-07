@@ -863,8 +863,10 @@ _GBM_REG_PARAMS = {
 _MAX_GBM_FEATURES = 16
 
 # Minimum training samples before the GBM is trusted over the
-# fallback weighted-average.
-_MIN_GBM_TRAIN_SAMPLES = 30
+# fallback weighted-average.  With 75 walk-forward samples the GBM
+# was overfitting (HR dropped from 46.7% baseline to 45.3%).
+# Require 500+ to accumulate enough regime diversity before enabling.
+_MIN_GBM_TRAIN_SAMPLES = 500
 
 
 class MetaLearnerModule:
@@ -1038,13 +1040,30 @@ class MetaLearnerModule:
 
     # ── Internal: feature extraction ──────────────────────────
 
+    # Features that leak runtime/meta information into training.
+    # These change based on VPS load, code path, and run order —
+    # not market state.  The GBM learns noise from them.
+    _LEAKAGE_SUFFIXES = frozenset({
+        "elapsed_ms",           # module timing (VPS load artifact)
+        "mc_iterations",        # constant config parameter
+        "mc_jump_lambda",       # derived from jump_prob (already a feature)
+        "mc_avg_max_dd",        # downstream MC stat (not an input signal)
+        "mc_worst_dd",          # downstream MC stat
+    })
+
     @staticmethod
     def _extract_features(outputs: list[ModuleOutput]) -> dict:
-        """Flatten all module features into a single dict."""
+        """Flatten all module features into a single dict.
+
+        Strips leakage features (timing, counters, MC meta) that
+        correlate with runtime variability rather than market state.
+        """
         all_features = {}
         for out in outputs:
             for k, v in out.features.items():
                 if isinstance(v, (int, float, bool)):
+                    if k in MetaLearnerModule._LEAKAGE_SUFFIXES:
+                        continue
                     all_features[f"{out.module_name}__{k}"] = float(v)
         return all_features
 
