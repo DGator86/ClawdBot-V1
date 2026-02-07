@@ -537,11 +537,13 @@ class Forecaster:
             if mc_out and "mc_p5_price" in mc_out.features:
                 # Use MC-derived quantiles (more accurate with jumps)
                 result.price_q05 = round(mc_out.features["mc_p5_price"], 2)
-                result.price_q10 = round(price * math.exp(ensemble_targets.quantile_10), 2)
+                result.price_q10 = round(mc_out.features.get("mc_p10_price",
+                    mc_out.features["mc_p5_price"] * 0.5 + mc_out.features["mc_p25_price"] * 0.5), 2)
                 result.price_q25 = round(mc_out.features["mc_p25_price"], 2)
                 result.price_q50 = round(mc_out.features["mc_median_price"], 2)
                 result.price_q75 = round(mc_out.features["mc_p75_price"], 2)
-                result.price_q90 = round(price * math.exp(ensemble_targets.quantile_90), 2)
+                result.price_q90 = round(mc_out.features.get("mc_p90_price",
+                    mc_out.features["mc_p75_price"] * 0.5 + mc_out.features["mc_p95_price"] * 0.5), 2)
                 result.price_q95 = round(mc_out.features["mc_p95_price"], 2)
             else:
                 # Gaussian approximation
@@ -552,6 +554,15 @@ class Forecaster:
                 result.price_q75 = round(price * math.exp(mu + 0.674 * sigma), 2)
                 result.price_q90 = round(price * math.exp(mu + 1.28 * sigma), 2)
                 result.price_q95 = round(price * math.exp(mu + 1.645 * sigma), 2)
+
+            # Enforce monotonic quantile ordering (Q05 <= Q10 <= ... <= Q95)
+            qs = [result.price_q05, result.price_q10, result.price_q25,
+                  result.price_q50, result.price_q75, result.price_q90, result.price_q95]
+            for i in range(1, len(qs)):
+                if qs[i] < qs[i - 1]:
+                    qs[i] = qs[i - 1]
+            (result.price_q05, result.price_q10, result.price_q25,
+             result.price_q50, result.price_q75, result.price_q90, result.price_q95) = qs
 
             # Barrier probs (from MC or ensemble)
             if mc_out and mc_out.targets.barrier_strike > 0:
@@ -700,7 +711,7 @@ def _print_report(r: ForecastResult):
     arrow = "\u2191" if r.direction == "Up" else "\u2193" if r.direction == "Down" else "\u2194"
 
     print(f"\n{'='*64}")
-    print(f"  12-PARADIGM ENSEMBLE FORECAST -- {r.symbol}")
+    print(f"  14-PARADIGM ENSEMBLE FORECAST -- {r.symbol}")
     print(f"{'='*64}")
     print(f"  Timestamp:        {r.timestamp}")
     print(f"  Horizon:          {r.horizon_hours}h")
@@ -746,6 +757,27 @@ def _print_report(r: ForecastResult):
     for name, info in r.module_outputs.items():
         if "error" in info:
             print(f"    {name:20s} ERROR: {info['error']}")
+        elif name == "regime_gate":
+            # Gate shows action/tier, not standard module format
+            action = info.get("action", "?")
+            tier = info.get("tier", "?")
+            orig = info.get("original_dir_prob", 0.5)
+            gated = info.get("gated_dir_prob", 0.5)
+            mult = info.get("multiplier", 1.0)
+            print(f"    {name:20s} {action:>8s} tier={tier} "
+                  f"dir: {orig:.3f}→{gated:.3f} mult={mult:.2f}")
+        elif name in ("particle_candle", "manifold_pattern"):
+            # Show pattern-specific info
+            conf = info.get("confidence", 0)
+            dp = info.get("direction_prob", 0.5)
+            d_arrow = "\u2191" if dp > 0.55 else "\u2193" if dp < 0.45 else "\u2194"
+            extra = ""
+            if name == "particle_candle":
+                extra = f" bars={info.get('n_event_bars', '?')}"
+            elif name == "manifold_pattern":
+                extra = f" {info.get('pattern', '?')}({info.get('breakout_bias', '?')})"
+            print(f"    {name:20s} conf={conf:.2f} dir={dp:.3f}{d_arrow}{extra} "
+                  f"t={info.get('elapsed_ms', 0):.0f}ms")
         else:
             conf = info.get("confidence", 0)
             dp = info.get("direction_prob", 0.5)
