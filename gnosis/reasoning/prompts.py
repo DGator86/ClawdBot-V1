@@ -180,7 +180,9 @@ OUTPUT FORMAT (JSON):
   "historical_context": "how this regime has historically resolved"
 }
 """
-        data = f"""KPCOFGS CLASSIFICATION:
+        data = f"""SYMBOL: {forecast.get('symbol', 'BTCUSDT')}
+
+KPCOFGS CLASSIFICATION:
 {json.dumps(kpcofgs, indent=2)}
 
 MAPPED REGIME: {kpcofgs_regime}
@@ -286,7 +288,9 @@ OUTPUT FORMAT (JSON):
 }
 """
         mc = forecast.get("mc_summary", {}) if isinstance(forecast.get("mc_summary"), dict) else {}
-        user = f"""RISK DATA:
+        user = f"""SYMBOL: {forecast.get('symbol', 'BTCUSDT')}
+
+RISK DATA:
 Current Price: ${forecast.get('current_price', 0):,.2f}
 Predicted Price: ${forecast.get('predicted_price', 0):,.2f}
 Volatility: {forecast.get('volatility', 0)}
