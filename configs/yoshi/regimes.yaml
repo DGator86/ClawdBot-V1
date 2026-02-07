@@ -1,0 +1,34 @@
+K:
+  labels: [K_TRENDING, K_MEAN_REVERTING, K_BALANCED]
+P:
+  labels: [P_VOL_EXPANDING, P_VOL_CONTRACTING, P_VOL_STABLE]
+C:
+  labels: [C_BUY_FLOW_DOMINANT, C_SELL_FLOW_DOMINANT, C_FLOW_NEUTRAL]
+O:
+  labels: [O_BREAKOUT, O_BREAKDOWN, O_RANGE, O_SWEEP_REVERT]
+F:
+  labels: [F_ACCEL, F_DECEL, F_STALL, F_REVERSAL]
+G:
+  labels: [G_TREND_CONT, G_TREND_EXH, G_MR_BOUNCE, G_MR_FADE, G_BO_HOLD, G_BO_FAIL]
+S:
+  labels:
+    - S_TC_PULLBACK_RESUME
+    - S_TC_ACCEL_BREAK
+    - S_TX_TOPPING_ROLL
+    - S_MR_OVERSHOOT_SNAPBACK
+    - S_MR_GRIND_BACK
+    - S_BO_LEVEL_BREAK_HOLD
+    - S_BO_LEVEL_BREAK_FAIL
+    - S_RANGE_EDGE_FADE
+    - S_RANGE_MID_MEANREV
+    - S_SWEEP_UP_REVERT
+    - S_SWEEP_DOWN_REVERT
+    - S_UNCERTAIN
+
+constraints_by_species:
+  S_UNCERTAIN:
+    confidence_floor: 0.0
+    preferred_horizon: "AUTO"
+  default:
+    confidence_floor: 0.65
+    preferred_horizon: "AUTO"
