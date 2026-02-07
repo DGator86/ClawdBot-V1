@@ -1,5 +1,5 @@
 """
-Crypto Forecasting Engine — 12 Paradigm Ensemble
+Crypto Forecasting Engine — 14 Paradigm Ensemble
 =================================================
 Modular ensemble forecaster implementing all major crypto prediction paradigms:
 
@@ -15,6 +15,8 @@ Modular ensemble forecaster implementing all major crypto prediction paradigms:
 10. Regime state machine + gating policy
 11. Monte Carlo envelope generator (regime-conditioned)
 12. Crowd/prediction-market implied priors
+13. Particle candle analysis (event-quantized bars + simplex geometry)
+14. Manifold pattern detection (motif clustering + classical mapping)
 
 Usage:
     from scripts.forecaster import Forecaster
@@ -30,6 +32,17 @@ from .rl_env import (
 from .ml_models import HybridPredictor, TemporalFeatureExtractor
 from .regime_gate import RegimeGate, ArbitrageDetector
 from .auto_fix import AutoFixPipeline, CalibrationSuite, HealthMonitor
+from .particle_candles import (
+    ParticleCandleModule,
+    ParticleCandleBuilder,
+    EventBar,
+    EventBarSequence,
+)
+from .manifold_patterns import (
+    ManifoldPatternModule,
+    ManifoldPatternDetector,
+    PatternDetection,
+)
 
 __all__ = [
     "Forecaster",
@@ -44,4 +57,11 @@ __all__ = [
     "AutoFixPipeline",
     "CalibrationSuite",
     "HealthMonitor",
+    "ParticleCandleModule",
+    "ParticleCandleBuilder",
+    "EventBar",
+    "EventBarSequence",
+    "ManifoldPatternModule",
+    "ManifoldPatternDetector",
+    "PatternDetection",
 ]
