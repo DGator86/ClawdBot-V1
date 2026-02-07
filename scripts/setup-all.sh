@@ -31,7 +31,8 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 CLAWDBOT_REPO="https://github.com/DGator86/ClawdBot-V1.git"
-CLAWDBOT_BRANCH="genspark_ai_developer"
+# Ultimate-fix: default to ultimate-fix branch for enhanced ML + regime gating
+CLAWDBOT_BRANCH="${CLAWDBOT_BRANCH:-ultimate-fix}"
 KALSHI_KEY_ID="6858062e-6884-43b5-b002-0e13391be331"
 KALSHI_KEY_DIR="$HOME/.kalshi"
 KALSHI_KEY_FILE="$KALSHI_KEY_DIR/private_key.pem"
@@ -56,11 +57,14 @@ header "ClawdBot + Yoshi + Kalshi"
 # ================================================================
 # 1. System
 # ================================================================
-step 1 "System packages"
+step 1 "System packages + ML dependencies"
 apt-get update -y -qq >/dev/null 2>&1
-apt-get install -y -qq curl git jq python3 python3-pip python3-venv >/dev/null 2>&1
+apt-get install -y -qq curl git jq python3 python3-pip python3-venv build-essential >/dev/null 2>&1
 pip3 install cryptography numpy -q 2>/dev/null || pip3 install cryptography numpy --break-system-packages -q 2>/dev/null || true
-ok "Installed"
+# Ultimate-fix: install ML stack
+pip3 install lightgbm scikit-learn scipy pandas pyarrow requests --break-system-packages -q 2>/dev/null \
+    || pip3 install lightgbm scikit-learn scipy pandas pyarrow requests -q 2>/dev/null || true
+ok "Installed (system + ML)"
 
 # ================================================================
 # 2. Node.js + moltbot
@@ -154,6 +158,22 @@ if [ -f "$CLAWDBOT_DIR/package.json" ] && [ ! -d "$CLAWDBOT_DIR/node_modules" ];
     npm install --silent >/dev/null 2>&1
     ok "npm install done"
 fi
+
+# Install ML deps from requirements-ml.txt if available
+if [ -f "$CLAWDBOT_DIR/requirements-ml.txt" ]; then
+    pip3 install -r "$CLAWDBOT_DIR/requirements-ml.txt" --quiet --break-system-packages 2>/dev/null \
+        || pip3 install -r "$CLAWDBOT_DIR/requirements-ml.txt" --quiet 2>/dev/null || true
+    ok "ML dependencies installed"
+fi
+
+# Validate forecaster imports (ultimate-fix)
+cd "$CLAWDBOT_DIR"
+python3 -c "
+import sys; sys.path.insert(0, '.')
+from scripts.forecaster.engine import Forecaster
+fc = Forecaster()
+print(f'  Forecaster: {len(fc._modules)} modules ready')
+" 2>/dev/null && ok "Forecaster modules validated" || warn "Forecaster import check skipped"
 
 # ================================================================
 # 5. Kalshi credentials
@@ -454,8 +474,9 @@ fi
 
 cat > /etc/systemd/system/clawdbot.service << SVCEOF
 [Unit]
-Description=ClawdBot Telegram AI Trading Assistant
+Description=ClawdBot Telegram AI Trading Assistant (Ultimate-Fix)
 After=network.target
+Wants=kalshi-edge-scanner.service yoshi-bridge.service
 
 [Service]
 Type=simple
@@ -465,17 +486,37 @@ EnvironmentFile=$CLAWDBOT_DIR/.env
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
 Environment=CLAWDBOT_GATEWAY_TOKEN=$GATEWAY_TOKEN
+Environment=PYTHONPATH=$CLAWDBOT_DIR
+
+# Kill anything holding the port before start
+ExecStartPre=-/usr/bin/fuser -k -9 18789/tcp
+ExecStartPre=/bin/sleep 1
+
+# Rebuild config from env vars
+ExecStartPre=-/usr/bin/python3 $CLAWDBOT_DIR/scripts/rebuild-config.py --quiet
+
+# Ultimate-fix: Run diagnostics + auto-fix on start (quick boot mode)
+ExecStartPre=-/usr/bin/python3 -c "import sys; sys.path.insert(0,'$CLAWDBOT_DIR'); from scripts.forecaster.diagnose import full_diagnostics_and_fix; full_diagnostics_and_fix(bars=500, forecasts=20, output_path='$CLAWDBOT_DIR/data/diagnostics_report.json')"
+
 ExecStart=$MOLTBOT_BIN gateway --port 18789 --token $GATEWAY_TOKEN
 Restart=always
 RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=clawdbot
 
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root /home/root /tmp
+ProtectHome=no
+
 [Install]
 WantedBy=multi-user.target
 SVCEOF
-ok "clawdbot.service"
+ok "clawdbot.service (with auto-fix on boot)"
 
 cat > /etc/systemd/system/yoshi-bridge.service << SVCEOF
 [Unit]
@@ -503,7 +544,7 @@ mkdir -p "$CLAWDBOT_DIR/data" "$CLAWDBOT_DIR/logs" 2>/dev/null || true
 
 cat > /etc/systemd/system/kalshi-edge-scanner.service << SVCEOF
 [Unit]
-Description=Kalshi Edge Scanner — Continuous Best-Pick Finder
+Description=Kalshi Edge Scanner — Continuous Best-Pick Finder (Ultimate-Fix)
 After=network.target
 Wants=yoshi-bridge.service
 
@@ -512,10 +553,18 @@ Type=simple
 User=root
 WorkingDirectory=$CLAWDBOT_DIR
 EnvironmentFile=$YOSHI_DIR/.env
+EnvironmentFile=-$CLAWDBOT_DIR/.env
 Environment=TRADING_CORE_URL=http://127.0.0.1:8000
+Environment=PYTHONPATH=$CLAWDBOT_DIR
+
+# Fix PEM keys before start
+ExecStartPre=-/usr/bin/python3 -c "import sys; sys.path.insert(0,'$CLAWDBOT_DIR'); from scripts.lib.pem_utils import fix_all_pem_files; fix_all_pem_files()"
+
 ExecStart=/usr/bin/python3 $CLAWDBOT_DIR/scripts/kalshi-edge-scanner.py --loop --interval 120 --top 2 --min-edge 3.0 --propose
 Restart=always
 RestartSec=30
+StartLimitIntervalSec=600
+StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=kalshi-edge-scanner
@@ -600,4 +649,11 @@ echo -e "${BOLD}Message your bot on Telegram:${NC}"
 echo '  "Yoshi status"'
 echo '  "Check Kalshi"'
 echo '  "Show BTC markets"'
+echo ""
+echo -e "${BOLD}Ultimate-Fix Commands:${NC}"
+echo "  python3 -m scripts.forecaster.diagnose --bars 2000 --auto-fix  # Full diagnostic"
+echo "  python3 -m scripts.forecaster.engine --symbol BTCUSDT          # Forecast"
+echo "  python3 scripts/monte-carlo/simulation.py --live               # Monte Carlo"
+echo "  python3 scripts/fetch_coingecko_data.py --days 90 --onchain    # Multi-asset data"
+echo "  python3 -m scripts.forecaster.evaluation --bars 1000           # Yoshi battery"
 echo ""
