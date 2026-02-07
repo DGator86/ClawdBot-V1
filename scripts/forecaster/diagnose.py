@@ -317,7 +317,6 @@ def run_diagnosis(n_bars: int = 2000,
     gbm_samples = len(fc_gbm.meta_learner._history)
 
     if verbose:
-        print(f"  Hybrid ML: HR={metrics_gbm.hit_rate:.1%}, "
         print(f"  GBM: HR={metrics_gbm.hit_rate:.1%}, "
               f"MCC={metrics_gbm.mcc:.4f}, "
               f"trained={gbm_trained}, samples={gbm_samples}")
@@ -359,9 +358,6 @@ def run_diagnosis(n_bars: int = 2000,
         print(f"    Drift:    {health.concept_drift_detected}")
         for alert in health.alerts:
             print(f"    ALERT:    {alert}")
-
-    # Use enhanced records for remaining diagnostics
-              f"GBM {'HELPED' if report.gbm_helped else 'HURT'}")
 
     # Use GBM records for remaining diagnostics
     records = records_gbm
@@ -487,11 +483,6 @@ def run_diagnosis(n_bars: int = 2000,
                 bar = "█" * int(min(score, 50))
                 print(f"  {name:45s}  {score:6.1f} {bar}")
     elif gbm_trained and fc_gbm.meta_learner._feature_names:
-    # ── GBM feature importance ────────────────────────────
-    if verbose:
-        print(f"\n--- GBM FEATURE IMPORTANCE ---")
-
-    if gbm_trained and fc_gbm.meta_learner._feature_names:
         imp = fc_gbm.meta_learner._dir_model.feature_importance(
             importance_type="gain")
         pairs = sorted(zip(fc_gbm.meta_learner._feature_names, imp),
@@ -668,10 +659,6 @@ def _render_verdict(r: DiagnosticReport) -> tuple[str, list[str]]:
             f"Actions: {', '.join(r.auto_fix_report.get('actions_taken', []))}"
         )
 
-            "Rolling HR is improving — the GBM may be learning. "
-            "More data could help."
-        )
-
     # MC
     if r.p5_p95_coverage > 0:
         if abs(r.p5_p95_coverage - 0.90) < 0.05:
@@ -740,10 +727,7 @@ def full_diagnostics_and_fix(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Forecaster Diagnostic Suite (Ultimate Enhanced)")
-def main():
-    parser = argparse.ArgumentParser(
-        description="Forecaster Diagnostic Suite")
+        description="Forecaster Diagnostic Suite (14-Paradigm)")
     parser.add_argument("--bars", type=int, default=2000)
     parser.add_argument("--forecasts", type=int, default=75)
     parser.add_argument("--json", action="store_true")
@@ -764,13 +748,6 @@ def main():
             max_forecasts=args.forecasts,
             verbose=not args.json,
         )
-    args = parser.parse_args()
-
-    report = run_diagnosis(
-        n_bars=args.bars,
-        max_forecasts=args.forecasts,
-        verbose=not args.json,
-    )
 
     if args.json or args.output:
         data = report.to_dict()
