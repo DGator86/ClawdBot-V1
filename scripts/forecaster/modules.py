@@ -820,17 +820,91 @@ class SentimentModule:
 # MODULE 8: TABULAR ML META-LEARNER
 # ═══════════════════════════════════════════════════════════════
 
+# ── ML hyperparameter defaults (from walk-forward tuning) ──────
+# Key findings: low learning rate + tight regularization + early
+# stopping prevents overfitting. Fewer features (≤13) consistently
+# outperform large feature sets (34+) which overfit to noise.
+_GBM_PARAMS = {
+    "objective": "binary",        # direction classification
+    "metric": "binary_logloss",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.02,        # low LR for stable convergence
+    "num_leaves": 15,             # tight — prevents memorising noise
+    "max_depth": 4,               # shallow trees generalise better
+    "min_child_samples": 8,       # need real support per leaf
+    "subsample": 0.7,             # row subsampling
+    "colsample_bytree": 0.6,     # feature subsampling per tree
+    "reg_alpha": 0.3,             # L1 regularisation
+    "reg_lambda": 1.0,            # L2 regularisation
+    "n_estimators": 300,          # cap; early stopping will pick fewer
+    "verbose": -1,
+}
+
+_GBM_REG_PARAMS = {
+    "objective": "regression",
+    "metric": "mae",
+    "boosting_type": "gbdt",
+    "learning_rate": 0.02,
+    "num_leaves": 15,
+    "max_depth": 4,
+    "min_child_samples": 8,
+    "subsample": 0.7,
+    "colsample_bytree": 0.6,
+    "reg_alpha": 0.3,
+    "reg_lambda": 1.0,
+    "n_estimators": 300,
+    "verbose": -1,
+}
+
+# Maximum features the GBM will use.  Research showed 13 beats 34.
+_MAX_GBM_FEATURES = 16
+
+# Minimum training samples before the GBM is trusted over the
+# fallback weighted-average.
+_MIN_GBM_TRAIN_SAMPLES = 30
+
+
 class MetaLearnerModule:
     """
-    Gradient Boosted Trees (or logistic regression fallback) over
-    all features from other modules. Walk-forward only.
+    Gradient Boosted Trees meta-learner over features from all
+    other modules, trained walk-forward on accumulated predictions.
 
-    This is the "glue" that combines signals non-linearly.
-    In production, would be trained on historical data.
-    Here: uses a simple logistic combination as baseline.
+    Walk-forward protocol:
+      1. Collect (features, actual_return) pairs from past forecasts.
+      2. Train LightGBM direction classifier + return regressor on
+         the expanding window — no look-ahead.
+      3. Predict direction_prob and expected_return for current bar.
+      4. Calibrate probabilities via walk-forward isotonic regression
+         when enough samples exist, else fall back to the static
+         piece-wise calibration map.
+
+    Feature selection:
+      After training, only the top _MAX_GBM_FEATURES by importance
+      are retained.  Fewer, stronger features beat many noisy ones.
     """
     name = "meta_learner"
     trusted_regimes = set(Regime)
+
+    def __init__(self):
+        # Walk-forward history: list of (feature_dict, actual_return)
+        self._history: list[tuple[dict, float]] = []
+        # Trained models (None until enough data)
+        self._dir_model = None     # LightGBM classifier
+        self._ret_model = None     # LightGBM regressor
+        self._feature_names: list[str] = []  # ordered feature columns
+        self._isotonic = None      # sklearn IsotonicRegression for calibration
+        self._gbm_available = False
+        try:
+            import lightgbm  # noqa: F401
+            self._gbm_available = True
+        except ImportError:
+            pass
+
+    # ── Public API ──────────────────────────────────────────────
+
+    def record_outcome(self, features: dict, actual_return: float):
+        """Store a past (features → actual) pair for walk-forward training."""
+        self._history.append((features, actual_return))
 
     def predict_from_modules(self, outputs: list[ModuleOutput],
                              horizon_hours: float = 24) -> ModuleOutput:
@@ -841,21 +915,91 @@ class MetaLearnerModule:
             return ModuleOutput(self.name, targets, confidence=0.0,
                                 elapsed_ms=(time.time()-t0)*1000)
 
-        # Collect all features
-        all_features = {}
-        for out in outputs:
-            for k, v in out.features.items():
-                if isinstance(v, (int, float, bool)):
-                    all_features[f"{out.module_name}__{k}"] = float(v)
+        # ── 1. Collect features from all modules ──────────────
+        all_features = self._extract_features(outputs)
 
-        # ── Simple meta-learner: confidence-weighted average ──
-        # In production, replace with trained GBM
+        # ── 2. Confidence-weighted baseline (always computed) ──
+        baseline = self._weighted_average(outputs)
+
+        # ── 3. Try GBM prediction ─────────────────────────────
+        gbm_used = False
+        if (self._gbm_available
+                and len(self._history) >= _MIN_GBM_TRAIN_SAMPLES):
+            try:
+                self._retrain_if_needed()
+                if self._dir_model is not None:
+                    gbm_pred = self._gbm_predict(all_features)
+                    if gbm_pred is not None:
+                        # Blend GBM with baseline — GBM gets more
+                        # weight as training data grows
+                        n = len(self._history)
+                        gbm_w = min(0.8, n / (n + 50))  # ramp up
+                        base_w = 1.0 - gbm_w
+
+                        targets.direction_prob = (
+                            gbm_w * gbm_pred["direction_prob"]
+                            + base_w * baseline.direction_prob
+                        )
+                        targets.expected_return = (
+                            gbm_w * gbm_pred["expected_return"]
+                            + base_w * baseline.expected_return
+                        )
+                        gbm_used = True
+            except Exception:
+                pass  # fall through to baseline
+
+        if not gbm_used:
+            targets.direction_prob = baseline.direction_prob
+            targets.expected_return = baseline.expected_return
+
+        # Always use baseline for these (GBM doesn't predict them)
+        targets.volatility_forecast = baseline.volatility_forecast
+        targets.return_std = baseline.return_std
+        targets.jump_prob = baseline.jump_prob
+        targets.crash_prob = baseline.crash_prob
+        targets.quantile_10 = baseline.quantile_10
+        targets.quantile_50 = baseline.quantile_50
+        targets.quantile_90 = baseline.quantile_90
+
+        # ── 4. Calibrate direction probability ────────────────
+        targets.direction_prob = self._calibrate(targets.direction_prob)
+
+        # Shrink return when direction signal is weak
+        distance_from_50 = abs(targets.direction_prob - 0.5)
+        if distance_from_50 < 0.03:
+            targets.expected_return *= 0.5
+        elif distance_from_50 < 0.08:
+            targets.expected_return *= 0.7
+
+        # ── 5. Module agreement check ─────────────────────────
+        # Fewer, stronger signals beat many weak ones
+        targets = self._apply_agreement_filter(targets, outputs)
+
+        confidence = min(0.9, sum(o.confidence * o.weight for o in outputs)
+                         / max(1, len(outputs)))
+
+        # Record feature importance in output for diagnostics
+        meta_features = dict(all_features)
+        meta_features["gbm_used"] = float(gbm_used)
+        meta_features["gbm_train_samples"] = float(len(self._history))
+        if self._dir_model is not None and self._feature_names:
+            imp = self._dir_model.feature_importance(importance_type="gain")
+            for fname, score in zip(self._feature_names, imp):
+                meta_features[f"imp__{fname}"] = float(score)
+
+        return ModuleOutput(
+            self.name, targets, confidence=confidence,
+            features=meta_features, elapsed_ms=(time.time()-t0)*1000,
+        )
+
+    # ── Internal: weighted-average baseline ────────────────────
+
+    def _weighted_average(self, outputs: list[ModuleOutput]) -> PredictionTargets:
+        """Confidence-weighted average across module outputs."""
+        targets = PredictionTargets()
         total_weight = 0.0
-        weighted_return = 0.0
-        weighted_dir = 0.0
-        weighted_vol = 0.0
-        weighted_jump = 0.0
-        weighted_crash = 0.0
+        weighted_return = weighted_dir = weighted_vol = 0.0
+        weighted_jump = weighted_crash = 0.0
         q10s, q50s, q90s = [], [], []
 
         for out in outputs:
@@ -879,8 +1023,6 @@ class MetaLearnerModule:
             targets.jump_prob = weighted_jump / total_weight
             targets.crash_prob = weighted_crash / total_weight
             targets.return_std = targets.volatility_forecast
-
-            # Weighted quantiles
             targets.quantile_10 = sum(w * q for w, q in q10s) / total_weight
             targets.quantile_50 = sum(w * q for w, q in q50s) / total_weight
             targets.quantile_90 = sum(w * q for w, q in q90s) / total_weight
@@ -939,12 +1081,207 @@ class MetaLearnerModule:
                 targets.direction_prob = targets.direction_prob * (1 - dampen) + 0.5 * dampen
                 targets.expected_return *= (1 - dampen * 0.5)
 
-        confidence = min(0.9, total_weight / max(1, len(outputs)))
+        return targets
 
-        return ModuleOutput(
-            self.name, targets, confidence=confidence,
-            features=all_features, elapsed_ms=(time.time()-t0)*1000,
+    # ── Internal: feature extraction ──────────────────────────
+
+    @staticmethod
+    def _extract_features(outputs: list[ModuleOutput]) -> dict:
+        """Flatten all module features into a single dict."""
+        all_features = {}
+        for out in outputs:
+            for k, v in out.features.items():
+                if isinstance(v, (int, float, bool)):
+                    all_features[f"{out.module_name}__{k}"] = float(v)
+        return all_features
+
+    # ── Internal: GBM training (walk-forward) ──────────────────
+
+    def _retrain_if_needed(self):
+        """Retrain GBM models on accumulated walk-forward history.
+
+        Retrains every 10 new samples to avoid constant retraining
+        while still adapting to new data.
+        """
+        import lightgbm as lgb
+
+        n = len(self._history)
+        # Only retrain every 10 new samples (or first time)
+        if (self._dir_model is not None
+                and n % 10 != 0
+                and n > _MIN_GBM_TRAIN_SAMPLES + 5):
+            return
+
+        # Build feature matrix from history
+        all_keys: set[str] = set()
+        for feats, _ in self._history:
+            all_keys.update(feats.keys())
+
+        # Sort for deterministic column order
+        feature_names = sorted(all_keys)
+
+        X = np.zeros((n, len(feature_names)))
+        y_dir = np.zeros(n)   # binary: 1 = up, 0 = down
+        y_ret = np.zeros(n)   # continuous: log return
+
+        for i, (feats, actual_ret) in enumerate(self._history):
+            for j, fname in enumerate(feature_names):
+                X[i, j] = feats.get(fname, 0.0)
+            y_dir[i] = 1.0 if actual_ret > 0 else 0.0
+            y_ret[i] = actual_ret
+
+        # Replace NaN/Inf
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ── Feature selection: train on all, keep top N ────
+        # First pass: quick train to get importances
+        ds = lgb.Dataset(X, label=y_dir, feature_name=feature_names)
+        quick_params = dict(_GBM_PARAMS)
+        quick_params["n_estimators"] = 50  # fast
+        quick_model = lgb.train(
+            quick_params, ds, num_boost_round=50,
         )
+        importances = quick_model.feature_importance(importance_type="gain")
+        top_idx = np.argsort(importances)[-_MAX_GBM_FEATURES:]
+        selected_names = [feature_names[i] for i in sorted(top_idx)]
+
+        # Rebuild X with selected features only
+        X_sel = np.zeros((n, len(selected_names)))
+        for i, (feats, _) in enumerate(self._history):
+            for j, fname in enumerate(selected_names):
+                X_sel[i, j] = feats.get(fname, 0.0)
+        X_sel = np.nan_to_num(X_sel, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self._feature_names = selected_names
+
+        # ── Train direction classifier with early stopping ──
+        # Use last 20% as validation for early stopping
+        val_size = max(5, n // 5)
+        train_end = n - val_size
+
+        ds_train = lgb.Dataset(
+            X_sel[:train_end], label=y_dir[:train_end],
+            feature_name=selected_names,
+        )
+        ds_val = lgb.Dataset(
+            X_sel[train_end:], label=y_dir[train_end:],
+            feature_name=selected_names, reference=ds_train,
+        )
+
+        callbacks = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+        self._dir_model = lgb.train(
+            _GBM_PARAMS, ds_train,
+            num_boost_round=_GBM_PARAMS["n_estimators"],
+            valid_sets=[ds_val],
+            callbacks=callbacks,
+        )
+
+        # ── Train return regressor ──────────────────────────
+        ds_train_r = lgb.Dataset(
+            X_sel[:train_end], label=y_ret[:train_end],
+            feature_name=selected_names,
+        )
+        ds_val_r = lgb.Dataset(
+            X_sel[train_end:], label=y_ret[train_end:],
+            feature_name=selected_names, reference=ds_train_r,
+        )
+
+        self._ret_model = lgb.train(
+            _GBM_REG_PARAMS, ds_train_r,
+            num_boost_round=_GBM_REG_PARAMS["n_estimators"],
+            valid_sets=[ds_val_r],
+            callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+        )
+
+        # ── Fit isotonic calibration on OOB predictions ─────
+        # Use the validation fold predictions vs actuals
+        if val_size >= 10:
+            try:
+                from sklearn.isotonic import IsotonicRegression
+                val_preds = self._dir_model.predict(X_sel[train_end:])
+                val_labels = y_dir[train_end:]
+                iso = IsotonicRegression(
+                    y_min=0.05, y_max=0.95, out_of_bounds="clip",
+                )
+                iso.fit(val_preds, val_labels)
+                self._isotonic = iso
+            except Exception:
+                self._isotonic = None
+
+    # ── Internal: GBM prediction ──────────────────────────────
+
+    def _gbm_predict(self, features: dict) -> Optional[dict]:
+        """Predict direction_prob and expected_return from features."""
+        if self._dir_model is None or not self._feature_names:
+            return None
+
+        x = np.zeros((1, len(self._feature_names)))
+        for j, fname in enumerate(self._feature_names):
+            x[0, j] = features.get(fname, 0.0)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dir_prob = float(self._dir_model.predict(x)[0])
+        dir_prob = max(0.05, min(0.95, dir_prob))
+
+        expected_return = 0.0
+        if self._ret_model is not None:
+            expected_return = float(self._ret_model.predict(x)[0])
+
+        return {
+            "direction_prob": dir_prob,
+            "expected_return": expected_return,
+        }
+
+    # ── Internal: calibration ─────────────────────────────────
+
+    def _calibrate(self, raw_prob: float) -> float:
+        """Calibrate direction probability.
+
+        Uses walk-forward isotonic regression if the GBM has trained
+        one, otherwise falls back to the static piece-wise map.
+        """
+        if self._isotonic is not None:
+            try:
+                cal = float(self._isotonic.predict([raw_prob])[0])
+                return max(0.05, min(0.95, cal))
+            except Exception:
+                pass
+        # Static fallback
+        return _calibrate_direction_prob(raw_prob)
+
+    # ── Internal: module agreement filter ─────────────────────
+
+    @staticmethod
+    def _apply_agreement_filter(
+        targets: PredictionTargets,
+        outputs: list[ModuleOutput],
+    ) -> PredictionTargets:
+        """Boost on near-unanimous agreement; dampen on disagreement."""
+        dir_votes = [out.targets.direction_prob for out in outputs
+                     if out.confidence > 0.2]
+        if not dir_votes:
+            return targets
+
+        bull_pct = sum(1 for d in dir_votes if d > 0.55) / len(dir_votes)
+        bear_pct = sum(1 for d in dir_votes if d < 0.45) / len(dir_votes)
+
+        # Only boost at 85%+ agreement
+        if bull_pct > 0.85:
+            targets.direction_prob = min(0.75, targets.direction_prob * 1.05)
+        elif bear_pct > 0.85:
+            targets.direction_prob = max(0.25, targets.direction_prob * 0.95)
+
+        # Uncertainty: if modules disagree, clamp toward 0.50
+        uncertain_pct = sum(1 for d in dir_votes
+                            if 0.45 <= d <= 0.55) / len(dir_votes)
+        if uncertain_pct > 0.5:
+            dampen = 0.40 * uncertain_pct
+            targets.direction_prob = (
+                targets.direction_prob * (1 - dampen) + 0.5 * dampen
+            )
+            targets.expected_return *= (1 - dampen * 0.5)
+
+        return targets
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -27,6 +27,9 @@ from .rl_env import (
     evaluate_forecaster_as_trader,
     commission_sweep,
 )
+from .ml_models import HybridPredictor, TemporalFeatureExtractor
+from .regime_gate import RegimeGate, ArbitrageDetector
+from .auto_fix import AutoFixPipeline, CalibrationSuite, HealthMonitor
 
 __all__ = [
     "Forecaster",
@@ -34,4 +37,11 @@ __all__ = [
     "ForecastTradingEnv",
     "evaluate_forecaster_as_trader",
     "commission_sweep",
+    "HybridPredictor",
+    "TemporalFeatureExtractor",
+    "RegimeGate",
+    "ArbitrageDetector",
+    "AutoFixPipeline",
+    "CalibrationSuite",
+    "HealthMonitor",
 ]

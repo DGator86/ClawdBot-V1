@@ -368,6 +368,27 @@ class WalkForwardEvaluator:
             self.records.append(record)
             n_forecasts += 1
 
+            # ── Feed outcome to meta-learner for walk-forward GBM ──
+            # The meta-learner accumulates (features, actual_return)
+            # pairs and retrains its GBM periodically.  We extract
+            # the numeric features from all base module outputs stored
+            # in the result, which is exactly the feature set the
+            # meta-learner uses for prediction.
+            try:
+                feat_dict = {}
+                for mod_name, mod_data in result.module_outputs.items():
+                    if mod_name in ("meta_learner",):
+                        continue
+                    if isinstance(mod_data, dict):
+                        for k, v in mod_data.items():
+                            if isinstance(v, (int, float)):
+                                feat_dict[f"{mod_name}__{k}"] = float(v)
+                if feat_dict:
+                    self.forecaster.meta_learner.record_outcome(
+                        feat_dict, actual_return)
+            except (AttributeError, TypeError):
+                pass  # forecaster may not expose meta_learner directly
+
             mc_tag = " [MC]" if record.mc_ran else ""
             if verbose and n_forecasts % 10 == 0:
                 elapsed = time.time() - t0
