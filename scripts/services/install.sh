@@ -113,6 +113,10 @@ echo -e "${CYAN}=== Installing ClawdBot Services (Ultimate-Fix) ===${NC}\n"
 
 # 1. Fix PEM keys
 echo -e "${YELLOW}[1/7] Fixing PEM keys...${NC}"
+echo -e "${CYAN}=== Installing ClawdBot Services ===${NC}\n"
+
+# 1. Fix PEM keys
+echo -e "${YELLOW}[1/5] Fixing PEM keys...${NC}"
 python3 -c "
 import sys
 sys.path.insert(0, '$PROJECT_DIR')
@@ -123,6 +127,7 @@ print(f'  Fixed {n} PEM file(s)')
 
 # 2. Sync environment
 echo -e "${YELLOW}[2/7] Syncing environment...${NC}"
+echo -e "${YELLOW}[2/5] Syncing environment...${NC}"
 python3 -c "
 import sys
 sys.path.insert(0, '$PROJECT_DIR')
@@ -163,6 +168,12 @@ except Exception as e:
 
 # 4. Install service files
 echo -e "${YELLOW}[6/7] Installing service files...${NC}"
+echo -e "${YELLOW}[3/5] Rebuilding moltbot.json...${NC}"
+python3 "$PROJECT_DIR/scripts/rebuild-config.py" --quiet 2>/dev/null || \
+    echo "  Skipped (rebuild-config.py not found)"
+
+# 4. Install service files
+echo -e "${YELLOW}[4/5] Installing service files...${NC}"
 
 # Find moltbot binary
 MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/local/bin/moltbot")
@@ -196,12 +207,14 @@ echo "  systemctl daemon-reload done"
 
 # 5. Enable services
 echo -e "${YELLOW}[7/7] Enabling services...${NC}"
+echo -e "${YELLOW}[5/5] Enabling services...${NC}"
 for svc in "${SERVICES[@]}"; do
     systemctl enable "$svc" 2>/dev/null || true
     echo -e "  ${GREEN}Enabled: ${svc}${NC}"
 done
 
 echo -e "\n${GREEN}=== Installation Complete (Ultimate-Fix) ===${NC}"
+echo -e "\n${GREEN}=== Installation Complete ===${NC}"
 echo ""
 echo "Commands:"
 echo "  systemctl start clawdbot                    # Start gateway"
