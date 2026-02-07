@@ -1,12 +1,20 @@
 """
-Forecaster Engine -- Ensemble Orchestrator
-============================================
+Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced)
+================================================================
 Wires all 12 modules through the regime gate, produces a unified
 ForecastResult, and exposes a simple `forecast()` API.
 
+Ultimate-fix enhancements:
+  - Hybrid ML: LightGBM + temporal features (replaces plain GBM)
+  - Regime gating: blocks anti-predictive regimes (range HR=41.8%)
+  - Auto-calibration: isotonic + Platt scaling on direction probs
+  - Health monitoring: rolling HR tracking with auto-retrain
+  - Arbitrage detection: spread + model-edge opportunities
+
 Architecture:
   MarketSnapshot -> [12 Modules] -> RegimeDetector -> GatingPolicy
-                                  -> MetaLearner -> MonteCarloModule
+                                  -> HybridPredictor -> RegimeGate
+                                  -> MonteCarloModule -> AutoFix
                                   -> ForecastResult
 
 Usage:
@@ -44,6 +52,11 @@ from .modules import (
     MonteCarloModule,
     CrowdPriorModule,
 )
+
+# Ultimate-fix imports
+from .ml_models import HybridPredictor, TemporalFeatureExtractor
+from .regime_gate import RegimeGate, ArbitrageDetector, should_trade, GateDecision
+from .auto_fix import AutoFixPipeline, CalibrationSuite
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -198,7 +211,10 @@ class Forecaster:
                  mc_iterations: int = 50_000,
                  mc_steps: int = 48,
                  mc_seed: int = 42,
-                 enable_mc: bool = True):
+                 enable_mc: bool = True,
+                 enable_regime_gate: bool = True,
+                 enable_hybrid_ml: bool = True,
+                 enable_auto_fix: bool = True):
         # ── Instantiate all modules ───────────────────────
         self.technical = TechnicalModule()
         self.classical = ClassicalStatsModule()
@@ -215,11 +231,21 @@ class Forecaster:
         self.meta_learner = MetaLearnerModule()
         self.monte_carlo = MonteCarloModule()
 
+        # ── Ultimate-fix: enhanced modules ─────────────────
+        self.hybrid_predictor = HybridPredictor()
+        self.regime_gate = RegimeGate()
+        self.auto_fix = AutoFixPipeline()
+        self.arb_detector = ArbitrageDetector()
+        self._temporal_extractor = TemporalFeatureExtractor(lookback=48)
+
         # Config
         self.mc_iterations = mc_iterations
         self.mc_steps = mc_steps
         self.mc_seed = mc_seed
         self.enable_mc = enable_mc
+        self.enable_regime_gate = enable_regime_gate
+        self.enable_hybrid_ml = enable_hybrid_ml
+        self.enable_auto_fix = enable_auto_fix
 
         # All predictive modules (order matters for feature flow)
         self._modules = [
@@ -324,6 +350,65 @@ class Forecaster:
         # Assign regime info to ensemble targets
         ensemble_targets.regime = dominant
         ensemble_targets.regime_probs = regime_probs
+
+        # ── Step 4b: Hybrid ML enhancement ────────────────
+        if self.enable_hybrid_ml and snap.closes:
+            try:
+                temporal_feats = self._temporal_extractor.extract(
+                    snap.closes, snap.volumes, snap.highs, snap.lows
+                )
+                all_features = MetaLearnerModule._extract_features(module_outputs)
+                for k, v in temporal_feats.items():
+                    all_features[f"temporal__{k}"] = v
+
+                self.hybrid_predictor.maybe_retrain()
+                hybrid_pred = self.hybrid_predictor.predict(all_features)
+                if hybrid_pred is not None:
+                    h_w = 0.40
+                    m_w = 1.0 - h_w
+                    ensemble_targets.direction_prob = (
+                        h_w * hybrid_pred["direction_prob"]
+                        + m_w * ensemble_targets.direction_prob
+                    )
+                    ensemble_targets.expected_return = (
+                        h_w * hybrid_pred["expected_return"]
+                        + m_w * ensemble_targets.expected_return
+                    )
+                    result.module_outputs["hybrid_ml"] = {
+                        "confidence": round(hybrid_pred["confidence"], 4),
+                        "direction_prob": round(hybrid_pred["direction_prob"], 4),
+                        "n_train_samples": hybrid_pred["n_train_samples"],
+                    }
+            except Exception as e:
+                result.module_outputs["hybrid_ml"] = {"error": str(e)}
+
+        # ── Step 4c: Regime gating ─────────────────────────
+        gate_decision = None
+        if self.enable_regime_gate:
+            try:
+                gate_decision = self.regime_gate.apply(
+                    ensemble_targets, regime_probs
+                )
+                result.module_outputs["regime_gate"] = {
+                    "action": gate_decision.action,
+                    "tier": gate_decision.tier,
+                    "original_dir_prob": round(gate_decision.original_direction_prob, 4),
+                    "gated_dir_prob": round(gate_decision.gated_direction_prob, 4),
+                    "multiplier": round(gate_decision.confidence_multiplier, 4),
+                }
+            except Exception as e:
+                result.module_outputs["regime_gate"] = {"error": str(e)}
+
+        # ── Step 4d: Auto-calibration ──────────────────────
+        if self.enable_auto_fix:
+            try:
+                cal_prob = self.auto_fix.calibrate_prob(
+                    ensemble_targets.direction_prob
+                )
+                if cal_prob != ensemble_targets.direction_prob:
+                    ensemble_targets.direction_prob = cal_prob
+            except Exception:
+                pass
 
         result.targets = ensemble_targets
 

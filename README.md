@@ -297,7 +297,6 @@ ClawdBot-V1/
 │   │   ├── evaluation.py           # Walk-forward backtester
 │   │   ├── data.py                 # OHLCV data fetcher (Coinbase/Kraken)
 │   │   ├── schemas.py              # Module interfaces & data types
-│   │   ├── rl_env.py               # TensorTrade RL trading environment
 │   │   └── bridge.py               # Forecaster -> edge scanner bridge
 │   └── monte-carlo/
 │       ├── simulation.py           # MC engine (legacy + live forecaster modes)
