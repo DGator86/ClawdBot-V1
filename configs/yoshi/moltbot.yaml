@@ -1,0 +1,22 @@
+ai:
+  provider: openai
+  model: gpt-4o-mini
+  api_key_env: OPENAI_API_KEY
+  endpoint: https://api.openai.com/v1/chat/completions
+  timeout_seconds: 30
+  system_prompt: >
+    You are Moltbot, a trading assistant. Use the forecast data and
+    risk constraints to propose a trade plan. Return JSON only.
+
+risk:
+  max_position_usd: 500
+  max_leverage: 2
+  daily_loss_limit_usd: 100
+
+services:
+  - name: slack
+    type: webhook
+    endpoint: https://hooks.slack.com/services/REPLACE/ME
+    method: POST
+    headers:
+      Content-Type: application/json

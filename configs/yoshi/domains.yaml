@@ -1,0 +1,9 @@
+domains:
+  D0: {type: "trade_count", n_trades: 200}
+  D1: {type: "trade_count", n_trades: 2000}
+  D2: {type: "trade_count", n_trades: 20000}
+  D3: {type: "trade_count", n_trades: 200000}
+
+decision_stride:
+  type: "trade_count"
+  n_trades: 200

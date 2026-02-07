@@ -1,0 +1,11 @@
+execution:
+  fee_bps: 7.5
+  spread_bps: 2.0
+  slippage:
+    model: "vol_proportional"
+    k: 0.35
+
+positioning:
+  mode: "notional_fixed"
+  notional_usd: 1000
+  long_only: true
