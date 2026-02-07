@@ -1,12 +1,15 @@
 ai:
   provider: openai
-  model: gpt-4o-mini
+  model: gpt-5
   api_key_env: OPENAI_API_KEY
-  endpoint: https://api.openai.com/v1/chat/completions
-  timeout_seconds: 30
+  endpoint: https://www.genspark.ai/api/llm_proxy/v1/chat/completions
+  timeout_seconds: 60
   system_prompt: >
-    You are Moltbot, a trading assistant. Use the forecast data and
-    risk constraints to propose a trade plan. Return JSON only.
+    You are Moltbot, the reasoning core of a dual-bot crypto trading system.
+    You receive forecast data from ClawdBot (14-paradigm ensemble) and
+    validation data from Yoshi (walk-forward, KPCOFGS regimes, backtest).
+    Use this data to propose trade plans. Return JSON only.
+    Be honest about signal quality. Never hallucinate edges.
 
 risk:
   max_position_usd: 500

@@ -712,7 +712,7 @@ def scan_kalshi_opportunities(
 
 @dataclass
 class UnifiedResult:
-    """Complete result from forecast + KPCOFGS + validation."""
+    """Complete result from forecast + KPCOFGS + validation + LLM reasoning."""
     # ClawdBot forecast
     forecast: Dict[str, Any] = field(default_factory=dict)
 
@@ -729,6 +729,9 @@ class UnifiedResult:
     # Kalshi opportunities
     opportunities: List[Dict] = field(default_factory=list)
 
+    # LLM Reasoning (if reasoning run)
+    reasoning: Dict[str, Any] = field(default_factory=dict)
+
     # Timing
     elapsed_ms: float = 0.0
 
@@ -743,17 +746,31 @@ def run_unified(
     symbol: str = "BTCUSDT",
     horizon_hours: float = 24.0,
     bars_limit: int = 2000,
-    mode: str = "forecast",  # "forecast", "validate", "backtest", "full"
+    mode: str = "forecast",  # "forecast", "validate", "backtest", "full", "reason"
     mc_iterations: int = 50_000,
     verbose: bool = True,
+    reasoning_mode: str = "auto",  # "auto", "full", "regime", "trade", "risk", "extrapolation", "critique", "off"
+    risk_budget_usd: float = 500.0,
+    max_leverage: float = 2.0,
 ) -> UnifiedResult:
-    """Run the unified ClawdBot + Yoshi pipeline.
+    """Run the unified ClawdBot + Yoshi + LLM pipeline.
 
     Modes:
         forecast:  ClawdBot 14-paradigm + KPCOFGS enrichment
         validate:  + walk-forward validation with purge/embargo
         backtest:  + backtest with PnL/Sharpe
-        full:      forecast + validate + backtest + Kalshi scan
+        full:      forecast + validate + backtest + Kalshi scan + LLM reasoning
+        reason:    forecast + KPCOFGS + LLM reasoning (skip heavy validation)
+
+    Reasoning modes:
+        auto:          Engine picks best mode based on data
+        full:          Complete analysis with trade suggestion
+        regime:        Deep KPCOFGS regime analysis
+        trade:         Specific trade plan with entry/exit/sizing
+        risk:          Risk assessment and hedging
+        extrapolation: Forward-looking scenarios
+        critique:      Self-critique of forecast weaknesses
+        off:           Skip LLM reasoning
     """
     t0 = time.time()
     result = UnifiedResult()
@@ -907,6 +924,63 @@ def run_unified(
         if verbose:
             print(f"\n[5/5] Backtest: SKIPPED (mode={mode})")
 
+    # ── Step 6: LLM Reasoning ────────────────────────────
+    enable_reasoning = (
+        reasoning_mode != "off"
+        and mode in ("forecast", "full", "reason")
+    )
+
+    if enable_reasoning:
+        if verbose:
+            print(f"\n[6/6] Running LLM reasoning ({reasoning_mode} mode)...")
+
+        try:
+            from gnosis.reasoning import ReasoningEngine, ReasoningConfig, AnalysisMode, LLMConfig
+
+            # Map string to AnalysisMode enum
+            _mode_map = {
+                "auto": AnalysisMode.AUTO,
+                "full": AnalysisMode.FULL_ANALYSIS,
+                "regime": AnalysisMode.REGIME_DEEP_DIVE,
+                "trade": AnalysisMode.TRADE_PLAN,
+                "risk": AnalysisMode.RISK_ASSESSMENT,
+                "extrapolation": AnalysisMode.EXTRAPOLATION,
+                "critique": AnalysisMode.SELF_CRITIQUE,
+            }
+            analysis_mode = _mode_map.get(reasoning_mode, AnalysisMode.AUTO)
+
+            reasoning_config = ReasoningConfig(
+                mode=analysis_mode,
+                llm_config=LLMConfig.from_yaml(),
+                risk_budget_usd=risk_budget_usd,
+                max_leverage=max_leverage,
+                verbose=verbose,
+            )
+
+            engine = ReasoningEngine(reasoning_config)
+            reasoning_result = engine.analyze(
+                forecast=result.forecast,
+                kpcofgs=result.kpcofgs,
+                kpcofgs_regime=result.kpcofgs_regime,
+                validation=result.validation if result.validation else None,
+                backtest=result.backtest if result.backtest else None,
+                opportunities=result.opportunities if result.opportunities else None,
+                mode=analysis_mode,
+            )
+
+            result.reasoning = reasoning_result.to_dict()
+
+            if verbose:
+                reasoning_result.print_summary()
+
+        except Exception as e:
+            result.reasoning = {"error": str(e)}
+            if verbose:
+                print(f"  LLM reasoning error: {e}")
+    else:
+        if verbose and mode not in ("validate", "backtest"):
+            print(f"\n[6/6] LLM Reasoning: SKIPPED (reasoning_mode={reasoning_mode})")
+
     result.elapsed_ms = round((time.time() - t0) * 1000, 1)
 
     if verbose:
@@ -927,6 +1001,12 @@ def run_unified(
                   f"({b.get('total_return_pct', 0):+.1f}%), "
                   f"Sharpe={b.get('sharpe', 0):.3f}, "
                   f"MaxDD={b.get('max_drawdown_pct', 0):.1f}%")
+        if result.reasoning and not result.reasoning.get("error"):
+            analysis = result.reasoning.get("analysis", {})
+            sq = analysis.get("signal_quality", analysis.get("overall_assessment", "?"))
+            ts = analysis.get("trade_suggestion", {})
+            action = ts.get("action", "?") if ts else "?"
+            print(f"  LLM Reasoning: signal={sq}, action={action}")
         print(f"{'='*60}")
 
     return result

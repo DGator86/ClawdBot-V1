@@ -20,13 +20,16 @@ class AIProviderConfig:
     """Configuration for the AI provider."""
 
     provider: str = "openai"
-    model: str = "gpt-4o-mini"
+    model: str = "gpt-5"
     api_key_env: str = "OPENAI_API_KEY"
-    endpoint: str = "https://api.openai.com/v1/chat/completions"
-    timeout_seconds: int = 30
+    endpoint: str = "https://www.genspark.ai/api/llm_proxy/v1/chat/completions"
+    timeout_seconds: int = 60
     system_prompt: str = (
-        "You are Moltbot, a trading assistant. Use the forecast data and "
-        "risk constraints to propose a trade plan. Return JSON only."
+        "You are Moltbot, the reasoning core of a dual-bot crypto trading system. "
+        "You receive forecast data from ClawdBot (14-paradigm ensemble) and "
+        "validation data from Yoshi (walk-forward, KPCOFGS regimes, backtest). "
+        "Use this data to propose trade plans. Return JSON only. "
+        "Be honest about signal quality. Never hallucinate edges."
     )
 
 
@@ -86,10 +89,28 @@ class OpenAIChatClient(AIClient):
         self.config = config
 
     def _get_api_key(self) -> str:
+        """Get API key from env var, or from ~/.genspark_llm.yaml."""
         api_key = os.getenv(self.config.api_key_env)
         if not api_key:
+            # Try loading from genspark config
+            config_path = os.path.join(
+                os.path.expanduser("~"), ".genspark_llm.yaml"
+            )
+            if os.path.exists(config_path):
+                try:
+                    raw = yaml.safe_load(open(config_path)) or {}
+                    key_raw = raw.get("openai", {}).get("api_key", "")
+                    if key_raw.startswith("${") and key_raw.endswith("}"):
+                        env_var = key_raw[2:-1]
+                        api_key = os.environ.get(env_var, "")
+                    else:
+                        api_key = key_raw
+                except Exception:
+                    pass
+        if not api_key:
             raise RuntimeError(
-                f"Missing API key in env var {self.config.api_key_env}."
+                f"Missing API key: set {self.config.api_key_env} env var "
+                f"or configure ~/.genspark_llm.yaml"
             )
         return api_key
 
