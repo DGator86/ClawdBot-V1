@@ -1,6 +1,27 @@
 """
+Forecaster Diagnostic Suite (Ultimate Enhanced)
+Honest assessment of model quality with auto-fix integration.
+
+Diagnostics:
+1. Is direction HR statistically better than coin flip?
+2. Is the hybrid ML (LightGBM+GRU) helping vs baseline?
+3. Where does the model work (regime/vol) and where does it fail?
+4. Is the model calibrated (isotonic/Platt)?
+5. Are features stable or just noise?
+6. Regime gate effectiveness
+7. Auto-fix recommendations with confidence
+
+Ultimate-fix enhancements:
+  - Hybrid ML comparison (LightGBM+GRU vs plain GBM)
+  - Regime gate validation (blocked vs strong regimes)
+  - Auto-calibration integration (isotonic + Platt)
+  - Health monitoring with drift detection
+  - Full auto-fix pipeline on FAIL verdict
+
+Run:
+    python3 -m scripts.forecaster.diagnose --bars 2000 --forecasts 75
+    python3 -m scripts.forecaster.diagnose --bars 2000 --auto-fix
 Forecaster Diagnostic Suite
-============================
 Honest assessment of model quality. Answers:
 
 1. Is direction HR statistically better than coin flip?
@@ -25,6 +46,8 @@ from .engine import Forecaster
 from .evaluation import WalkForwardEvaluator, EvalRecord
 from .data import fetch_ohlcv_bars
 from .schemas import MarketSnapshot, Bar
+from .auto_fix import AutoFixPipeline, CalibrationSuite, HealthMonitor, HealthStatus
+from .regime_gate import RegimeGate, GateDecision, DEFAULT_REGIME_PROFILES
 
 
 # ─── Data structures ─────────────────────────────────────────
@@ -71,6 +94,16 @@ class DiagnosticReport:
     # MC quality
     p5_p95_coverage: float = 0.0
     mc_price_mae_pct: float = 0.0
+
+    # Ultimate-fix: enhanced diagnostics
+    hybrid_ml_hr: float = 0.0
+    hybrid_ml_mcc: float = 0.0
+    hybrid_ml_helped: bool = False
+    regime_gate_stats: dict = field(default_factory=dict)
+    auto_fix_applied: bool = False
+    auto_fix_report: dict = field(default_factory=dict)
+    health_status: dict = field(default_factory=dict)
+    calibration_ece: float = 0.0
 
     # Verdict
     verdict: str = ""
@@ -219,6 +252,14 @@ def run_diagnosis(n_bars: int = 2000,
 
     report.date_range = f"{bars[0].timestamp} → {bars[-1].timestamp}"
 
+    # ── Run A: BASELINE (no hybrid ML, no regime gate) ────
+    if verbose:
+        print(f"\n--- TEST A: Baseline (weighted average, no hybrid ML) ---")
+
+    fc_base = Forecaster(
+        enable_mc=True, enable_hybrid_ml=False,
+        enable_regime_gate=False, enable_auto_fix=False,
+    )
     # ── Run A: BASELINE (no GBM — fresh forecaster) ───────
     if verbose:
         print(f"\n--- TEST A: Baseline (weighted average, no GBM) ---")
@@ -239,6 +280,14 @@ def run_diagnosis(n_bars: int = 2000,
               f"MCC={metrics_base.mcc:.4f}, "
               f"n={len(records_base)}")
 
+    # ── Run B: WITH Hybrid ML + Regime Gate + Auto-Fix ────
+    if verbose:
+        print(f"\n--- TEST B: Hybrid ML + Regime Gate + Auto-Calibration ---")
+
+    fc_gbm = Forecaster(
+        enable_mc=True, enable_hybrid_ml=True,
+        enable_regime_gate=True, enable_auto_fix=True,
+    )
     # ── Run B: WITH GBM ───────────────────────────────────
     # The GBM trains walk-forward during the evaluation, so
     # early forecasts use baseline, later ones use GBM.
@@ -259,15 +308,59 @@ def run_diagnosis(n_bars: int = 2000,
     report.gbm_mcc = metrics_gbm.mcc
     report.gbm_helped = (metrics_gbm.mcc > metrics_base.mcc)
 
+    # Track hybrid ML stats
+    report.hybrid_ml_hr = metrics_gbm.hit_rate
+    report.hybrid_ml_mcc = metrics_gbm.mcc
+    report.hybrid_ml_helped = report.gbm_helped
+
     gbm_trained = fc_gbm.meta_learner._dir_model is not None
     gbm_samples = len(fc_gbm.meta_learner._history)
 
     if verbose:
+        print(f"  Hybrid ML: HR={metrics_gbm.hit_rate:.1%}, "
         print(f"  GBM: HR={metrics_gbm.hit_rate:.1%}, "
               f"MCC={metrics_gbm.mcc:.4f}, "
               f"trained={gbm_trained}, samples={gbm_samples}")
         delta = metrics_gbm.hit_rate - metrics_base.hit_rate
         print(f"  Delta: HR {delta:+.1%}, "
+              f"Hybrid ML {'HELPED' if report.gbm_helped else 'HURT'}")
+
+    # ── Regime gate stats ─────────────────────────────────
+    gate_info = fc_gbm.regime_gate
+    for regime_name, hits in gate_info._live_hits.items():
+        if hits:
+            report.regime_gate_stats[regime_name] = {
+                "n": len(hits),
+                "hit_rate": round(sum(hits) / len(hits), 4),
+            }
+    if verbose and report.regime_gate_stats:
+        print(f"\n  Regime Gate Live Stats:")
+        for rname, rstat in report.regime_gate_stats.items():
+            print(f"    {rname:20s}: HR={rstat['hit_rate']:.1%} (n={rstat['n']})")
+
+    # ── Health monitor status ─────────────────────────────
+    health = fc_gbm.auto_fix.monitor.check_health()
+    report.health_status = {
+        "is_healthy": health.is_healthy,
+        "rolling_hr_10": round(health.rolling_hr_10, 4),
+        "rolling_hr_20": round(health.rolling_hr_20, 4),
+        "mcc_last_20": round(health.mcc_last_20, 4),
+        "coverage": round(health.coverage_p5_p95, 4),
+        "drift_detected": health.concept_drift_detected,
+        "needs_retrain": health.needs_retrain,
+        "alerts": health.alerts,
+    }
+    if verbose:
+        print(f"\n  Health Monitor:")
+        print(f"    Healthy:  {health.is_healthy}")
+        print(f"    HR(10):   {health.rolling_hr_10:.1%}")
+        print(f"    HR(20):   {health.rolling_hr_20:.1%}")
+        print(f"    MCC(20):  {health.mcc_last_20:.4f}")
+        print(f"    Drift:    {health.concept_drift_detected}")
+        for alert in health.alerts:
+            print(f"    ALERT:    {alert}")
+
+    # Use enhanced records for remaining diagnostics
               f"GBM {'HELPED' if report.gbm_helped else 'HURT'}")
 
     # Use GBM records for remaining diagnostics
@@ -380,6 +473,20 @@ def run_diagnosis(n_bars: int = 2000,
     report.p5_p95_coverage = mc.get("p5_p95_coverage", 0)
     report.mc_price_mae_pct = mc.get("mc_price_mae_pct", 0)
 
+    # ── Feature importance (hybrid ML or GBM) ────────────
+    if verbose:
+        print(f"\n--- FEATURE IMPORTANCE ---")
+
+    # Try hybrid predictor first, then meta-learner
+    hybrid = fc_gbm.hybrid_predictor
+    if hybrid.is_trained:
+        report.feature_importances = hybrid.get_feature_importances()[:15]
+        if verbose:
+            print(f"  Source: HybridPredictor (LightGBM + temporal)")
+            for name, score in report.feature_importances[:10]:
+                bar = "█" * int(min(score, 50))
+                print(f"  {name:45s}  {score:6.1f} {bar}")
+    elif gbm_trained and fc_gbm.meta_learner._feature_names:
     # ── GBM feature importance ────────────────────────────
     if verbose:
         print(f"\n--- GBM FEATURE IMPORTANCE ---")
@@ -391,6 +498,7 @@ def run_diagnosis(n_bars: int = 2000,
                        key=lambda x: -x[1])
         report.feature_importances = [(n, float(s)) for n, s in pairs[:15]]
         if verbose:
+            print(f"  Source: MetaLearner GBM")
             for name, score in report.feature_importances[:10]:
                 bar = "█" * int(min(score, 50))
                 print(f"  {name:45s}  {score:6.1f} {bar}")
@@ -398,6 +506,25 @@ def run_diagnosis(n_bars: int = 2000,
             print(f"  Zero-importance features: {zero_imp}/{len(pairs)}")
     else:
         if verbose:
+            print(f"  No ML model trained (insufficient samples)")
+
+    # ── AUTO-FIX (when enabled) ───────────────────────────
+    auto_fix_report = fc_gbm.auto_fix.check_and_fix()
+    report.auto_fix_applied = auto_fix_report.retrain_triggered or auto_fix_report.calibration_applied
+    report.auto_fix_report = {
+        "calibration_applied": auto_fix_report.calibration_applied,
+        "calibration_method": auto_fix_report.calibration_method,
+        "retrain_triggered": auto_fix_report.retrain_triggered,
+        "confidence_scalar_adjusted": auto_fix_report.confidence_scalar_adjusted,
+        "new_confidence_scalar": auto_fix_report.new_confidence_scalar,
+        "actions_taken": auto_fix_report.actions_taken,
+        "verdict": auto_fix_report.verdict,
+    }
+    if verbose and auto_fix_report.actions_taken:
+        print(f"\n--- AUTO-FIX PIPELINE ---")
+        print(f"  Status: {auto_fix_report.verdict}")
+        for action in auto_fix_report.actions_taken:
+            print(f"  ACTION: {action}")
             print(f"  GBM not trained (insufficient samples)")
 
     # ── VERDICT ───────────────────────────────────────────
@@ -505,6 +632,42 @@ def _render_verdict(r: DiagnosticReport) -> tuple[str, list[str]]:
         )
     elif r.rolling_trend == "improving":
         recs.append(
+            "Rolling HR is improving — the hybrid ML may be learning. "
+            "More data could help."
+        )
+
+    # Hybrid ML specific
+    if r.hybrid_ml_helped:
+        recs.append(
+            f"Hybrid ML (LightGBM+GRU) improved performance: "
+            f"HR={r.hybrid_ml_hr:.1%}, MCC={r.hybrid_ml_mcc:.4f}. "
+            f"Keep enabled."
+        )
+    elif r.hybrid_ml_hr > 0:
+        recs.append(
+            f"Hybrid ML did not help (HR={r.hybrid_ml_hr:.1%}). "
+            f"Consider disabling until more data."
+        )
+
+    # Health monitoring
+    if r.health_status.get("drift_detected"):
+        problems += 1
+        recs.append(
+            "Concept drift DETECTED by health monitor. "
+            "Auto-retrain should be triggered."
+        )
+    if r.health_status.get("needs_retrain"):
+        recs.append(
+            "Health monitor recommends RETRAIN due to degraded performance."
+        )
+
+    # Auto-fix
+    if r.auto_fix_applied:
+        recs.append(
+            f"Auto-fix pipeline applied: {r.auto_fix_report.get('verdict', 'unknown')}. "
+            f"Actions: {', '.join(r.auto_fix_report.get('actions_taken', []))}"
+        )
+
             "Rolling HR is improving — the GBM may be learning. "
             "More data could help."
         )
@@ -537,6 +700,47 @@ def _render_verdict(r: DiagnosticReport) -> tuple[str, list[str]]:
 
 # ─── CLI ──────────────────────────────────────────────────────
 
+def full_diagnostics_and_fix(
+    n_bars: int = 2000,
+    max_forecasts: int = 75,
+    auto_fix: bool = True,
+    verbose: bool = True,
+) -> DiagnosticReport:
+    """
+    Run full diagnostics with auto-fix.
+    Called by clawdbot.service ExecStartPre for health check on boot.
+
+    Returns DiagnosticReport with verdict and any actions taken.
+    """
+    report = run_diagnosis(n_bars=n_bars, max_forecasts=max_forecasts, verbose=verbose)
+
+    if auto_fix and report.verdict.startswith(("POOR", "WEAK")):
+        if verbose:
+            print(f"\n  AUTO-FIX: Verdict is {report.verdict}, running fixes...")
+        # The auto-fix is already integrated into the Forecaster,
+        # so the report already contains any auto-fix actions.
+        # Additional fix: write a recovery marker file
+        try:
+            import os
+            marker_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "data", "diagnostics_report.json",
+            )
+            os.makedirs(os.path.dirname(marker_path), exist_ok=True)
+            with open(marker_path, "w") as f:
+                json.dump(report.to_dict(), f, indent=2, default=str)
+            if verbose:
+                print(f"  Diagnostic report saved to {marker_path}")
+        except Exception as e:
+            if verbose:
+                print(f"  Could not save report: {e}")
+
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Forecaster Diagnostic Suite (Ultimate Enhanced)")
 def main():
     parser = argparse.ArgumentParser(
         description="Forecaster Diagnostic Suite")
@@ -544,6 +748,22 @@ def main():
     parser.add_argument("--forecasts", type=int, default=75)
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--output", type=str, default=None)
+    parser.add_argument("--auto-fix", action="store_true",
+                        help="Run full diagnostics with auto-fix pipeline")
+    args = parser.parse_args()
+
+    if args.auto_fix:
+        report = full_diagnostics_and_fix(
+            n_bars=args.bars,
+            max_forecasts=args.forecasts,
+            verbose=not args.json,
+        )
+    else:
+        report = run_diagnosis(
+            n_bars=args.bars,
+            max_forecasts=args.forecasts,
+            verbose=not args.json,
+        )
     args = parser.parse_args()
 
     report = run_diagnosis(

@@ -86,6 +86,9 @@ def _calibrate_direction_prob(raw_prob: float) -> float:
     Maps raw ensemble direction_prob to calibrated probability using
     piece-wise linear interpolation from backtest observed frequencies.
 
+    TensorTrade research insight: prediction engines tend to be
+    over-confident in the 0.55-0.70 range (moderate bullish bias).
+    The agent "knows" direction but overstates certainty. This map
     Backtest insight: prediction engines tend to be over-confident
     in the 0.55-0.70 range (moderate bullish bias). The ensemble
     "knows" direction but overstates certainty. This map
@@ -1027,6 +1030,60 @@ class MetaLearnerModule:
             targets.quantile_50 = sum(w * q for w, q in q50s) / total_weight
             targets.quantile_90 = sum(w * q for w, q in q90s) / total_weight
 
+        # ── Post-hoc calibration (TensorTrade-inspired) ────
+        #
+        # TensorTrade research key finding: the RL agent COULD predict
+        # direction (+$239 at 0% commission) but was poorly calibrated.
+        # The fix: map predicted probabilities to observed frequencies.
+        #
+        # From our 75-forecast backtest (2000 bars BTCUSDT):
+        #   Raw pred 0.37 → observed 0.50  (under-confident)
+        #   Raw pred 0.47 → observed 0.46  (well calibrated)
+        #   Raw pred 0.54 → observed 0.43  (over-confident)
+        #   Raw pred 0.63 → observed 0.46  (very over-confident)
+        #
+        # Pattern: the model is well-calibrated near 0.45-0.50 but
+        # over-predicts confidence as it moves away from 0.50 in
+        # either direction (especially bullish side 0.55-0.70).
+        #
+        # Calibration map: piece-wise linear correction
+        # Maps raw_prob → calibrated_prob using observed frequencies
+        dp = targets.direction_prob
+        dp = _calibrate_direction_prob(dp)
+        targets.direction_prob = dp
+
+        # Also shrink expected return proportionally
+        # (direction and magnitude should be consistent)
+        distance_from_50 = abs(dp - 0.5)
+        if distance_from_50 < 0.03:
+            # Very near 0.50: shrink return (almost no directional edge)
+            targets.expected_return *= 0.5
+        elif distance_from_50 < 0.08:
+            targets.expected_return *= 0.7
+
+        # ── Module agreement check ────────────────────────
+        # Only boost on near-unanimous agreement (TensorTrade
+        # lesson: fewer, stronger signals beat many weak ones)
+        dir_votes = [out.targets.direction_prob for out in outputs
+                     if out.confidence > 0.2]
+        if dir_votes:
+            bull_pct = sum(1 for d in dir_votes if d > 0.55) / len(dir_votes)
+            bear_pct = sum(1 for d in dir_votes if d < 0.45) / len(dir_votes)
+
+            # Only boost at 85%+ agreement (was 80%)
+            if bull_pct > 0.85:
+                targets.direction_prob = min(0.75, targets.direction_prob * 1.05)
+            elif bear_pct > 0.85:
+                targets.direction_prob = max(0.25, targets.direction_prob * 0.95)
+
+            # Uncertainty signal: if modules disagree, clamp hard
+            uncertain_pct = sum(1 for d in dir_votes if 0.45 <= d <= 0.55) / len(dir_votes)
+            if uncertain_pct > 0.5:
+                # Majority of modules are uncertain → clamp to 0.50
+                dampen = 0.40 * uncertain_pct
+                targets.direction_prob = targets.direction_prob * (1 - dampen) + 0.5 * dampen
+                targets.expected_return *= (1 - dampen * 0.5)
+
         return targets
 
     # ── Internal: feature extraction ──────────────────────────
@@ -1138,6 +1195,207 @@ class MetaLearnerModule:
             valid_sets=[ds_val_r],
             callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
         )
+        return targets
+
+    # ── Internal: feature extraction ──────────────────────────
+
+    @staticmethod
+    def _extract_features(outputs: list[ModuleOutput]) -> dict:
+        """Flatten all module features into a single dict."""
+        all_features = {}
+        for out in outputs:
+            for k, v in out.features.items():
+                if isinstance(v, (int, float, bool)):
+                    all_features[f"{out.module_name}__{k}"] = float(v)
+        return all_features
+
+    # ── Internal: GBM training (walk-forward) ──────────────────
+
+    def _retrain_if_needed(self):
+        """Retrain GBM models on accumulated walk-forward history.
+
+        Retrains every 10 new samples to avoid constant retraining
+        while still adapting to new data.
+        """
+        import lightgbm as lgb
+
+        n = len(self._history)
+        # Only retrain every 10 new samples (or first time)
+        if (self._dir_model is not None
+                and n % 10 != 0
+                and n > _MIN_GBM_TRAIN_SAMPLES + 5):
+            return
+
+        # Build feature matrix from history
+        all_keys: set[str] = set()
+        for feats, _ in self._history:
+            all_keys.update(feats.keys())
+
+        # Sort for deterministic column order
+        feature_names = sorted(all_keys)
+
+        X = np.zeros((n, len(feature_names)))
+        y_dir = np.zeros(n)   # binary: 1 = up, 0 = down
+        y_ret = np.zeros(n)   # continuous: log return
+
+        for i, (feats, actual_ret) in enumerate(self._history):
+            for j, fname in enumerate(feature_names):
+                X[i, j] = feats.get(fname, 0.0)
+            y_dir[i] = 1.0 if actual_ret > 0 else 0.0
+            y_ret[i] = actual_ret
+
+        # Replace NaN/Inf
+        X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ── Feature selection: train on all, keep top N ────
+        # First pass: quick train to get importances
+        ds = lgb.Dataset(X, label=y_dir, feature_name=feature_names)
+        quick_params = dict(_GBM_PARAMS)
+        quick_params["n_estimators"] = 50  # fast
+        quick_model = lgb.train(
+            quick_params, ds, num_boost_round=50,
+        )
+        importances = quick_model.feature_importance(importance_type="gain")
+        top_idx = np.argsort(importances)[-_MAX_GBM_FEATURES:]
+        selected_names = [feature_names[i] for i in sorted(top_idx)]
+
+        # Rebuild X with selected features only
+        X_sel = np.zeros((n, len(selected_names)))
+        for i, (feats, _) in enumerate(self._history):
+            for j, fname in enumerate(selected_names):
+                X_sel[i, j] = feats.get(fname, 0.0)
+        X_sel = np.nan_to_num(X_sel, nan=0.0, posinf=0.0, neginf=0.0)
+
+        self._feature_names = selected_names
+
+        # ── Train direction classifier with early stopping ──
+        # Use last 20% as validation for early stopping
+        val_size = max(5, n // 5)
+        train_end = n - val_size
+
+        ds_train = lgb.Dataset(
+            X_sel[:train_end], label=y_dir[:train_end],
+            feature_name=selected_names,
+        )
+        ds_val = lgb.Dataset(
+            X_sel[train_end:], label=y_dir[train_end:],
+            feature_name=selected_names, reference=ds_train,
+        )
+
+        callbacks = [lgb.early_stopping(stopping_rounds=20, verbose=False)]
+        self._dir_model = lgb.train(
+            _GBM_PARAMS, ds_train,
+            num_boost_round=_GBM_PARAMS["n_estimators"],
+            valid_sets=[ds_val],
+            callbacks=callbacks,
+        )
+
+        # ── Train return regressor ──────────────────────────
+        ds_train_r = lgb.Dataset(
+            X_sel[:train_end], label=y_ret[:train_end],
+            feature_name=selected_names,
+        )
+        ds_val_r = lgb.Dataset(
+            X_sel[train_end:], label=y_ret[train_end:],
+            feature_name=selected_names, reference=ds_train_r,
+        )
+
+        self._ret_model = lgb.train(
+            _GBM_REG_PARAMS, ds_train_r,
+            num_boost_round=_GBM_REG_PARAMS["n_estimators"],
+            valid_sets=[ds_val_r],
+            callbacks=[lgb.early_stopping(stopping_rounds=20, verbose=False)],
+        )
+
+        # ── Fit isotonic calibration on OOB predictions ─────
+        # Use the validation fold predictions vs actuals
+        if val_size >= 10:
+            try:
+                from sklearn.isotonic import IsotonicRegression
+                val_preds = self._dir_model.predict(X_sel[train_end:])
+                val_labels = y_dir[train_end:]
+                iso = IsotonicRegression(
+                    y_min=0.05, y_max=0.95, out_of_bounds="clip",
+                )
+                iso.fit(val_preds, val_labels)
+                self._isotonic = iso
+            except Exception:
+                self._isotonic = None
+
+    # ── Internal: GBM prediction ──────────────────────────────
+
+    def _gbm_predict(self, features: dict) -> Optional[dict]:
+        """Predict direction_prob and expected_return from features."""
+        if self._dir_model is None or not self._feature_names:
+            return None
+
+        x = np.zeros((1, len(self._feature_names)))
+        for j, fname in enumerate(self._feature_names):
+            x[0, j] = features.get(fname, 0.0)
+        x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
+
+        dir_prob = float(self._dir_model.predict(x)[0])
+        dir_prob = max(0.05, min(0.95, dir_prob))
+
+        expected_return = 0.0
+        if self._ret_model is not None:
+            expected_return = float(self._ret_model.predict(x)[0])
+
+        return {
+            "direction_prob": dir_prob,
+            "expected_return": expected_return,
+        }
+
+    # ── Internal: calibration ─────────────────────────────────
+
+    def _calibrate(self, raw_prob: float) -> float:
+        """Calibrate direction probability.
+
+        Uses walk-forward isotonic regression if the GBM has trained
+        one, otherwise falls back to the static piece-wise map.
+        """
+        if self._isotonic is not None:
+            try:
+                cal = float(self._isotonic.predict([raw_prob])[0])
+                return max(0.05, min(0.95, cal))
+            except Exception:
+                pass
+        # Static fallback
+        return _calibrate_direction_prob(raw_prob)
+
+    # ── Internal: module agreement filter ─────────────────────
+
+    @staticmethod
+    def _apply_agreement_filter(
+        targets: PredictionTargets,
+        outputs: list[ModuleOutput],
+    ) -> PredictionTargets:
+        """Boost on near-unanimous agreement; dampen on disagreement."""
+        dir_votes = [out.targets.direction_prob for out in outputs
+                     if out.confidence > 0.2]
+        if not dir_votes:
+            return targets
+
+        bull_pct = sum(1 for d in dir_votes if d > 0.55) / len(dir_votes)
+        bear_pct = sum(1 for d in dir_votes if d < 0.45) / len(dir_votes)
+
+        # Only boost at 85%+ agreement
+        if bull_pct > 0.85:
+            targets.direction_prob = min(0.75, targets.direction_prob * 1.05)
+        elif bear_pct > 0.85:
+            targets.direction_prob = max(0.25, targets.direction_prob * 0.95)
+
+        # Uncertainty: if modules disagree, clamp toward 0.50
+        uncertain_pct = sum(1 for d in dir_votes
+                            if 0.45 <= d <= 0.55) / len(dir_votes)
+        if uncertain_pct > 0.5:
+            dampen = 0.40 * uncertain_pct
+            targets.direction_prob = (
+                targets.direction_prob * (1 - dampen) + 0.5 * dampen
+            )
+            targets.expected_return *= (1 - dampen * 0.5)
+
+        return targets
 
         # ── Fit isotonic calibration on OOB predictions ─────
         # Use the validation fold predictions vs actuals

@@ -1,13 +1,28 @@
 """
-Forecaster Engine -- Ensemble Orchestrator
-============================================
-Wires all 12 modules through the regime gate, produces a unified
+Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced + Particle)
+==========================================================================
+Wires all 14 modules through the regime gate, produces a unified
 ForecastResult, and exposes a simple `forecast()` API.
 
+Ultimate-fix enhancements:
+  - Hybrid ML: LightGBM + temporal features (replaces plain GBM)
+  - Regime gating: blocks anti-predictive regimes (range HR=41.8%)
+  - Auto-calibration: isotonic + Platt scaling on direction probs
+  - Health monitoring: rolling HR tracking with auto-retrain
+  - Arbitrage detection: spread + model-edge opportunities
+
+Particle candle enhancements:
+  - Event-quantized bars: aggregate by volume/trades/entropy (not clock time)
+  - Simplex geometry: B + W_u + W_l = 1 on the candle manifold
+  - Manifold patterns: GMM clustering + classical pattern template matching
+  - Forward distributions: conditional P(Δp | pattern, regime) per cluster
+
 Architecture:
-  MarketSnapshot -> [12 Modules] -> RegimeDetector -> GatingPolicy
-                                  -> MetaLearner -> MonteCarloModule
-                                  -> ForecastResult
+  MarketSnapshot -> [9 Base Modules] -> RegimeDetector -> GatingPolicy
+                 -> ParticleCandleModule -> ManifoldPatternModule
+                 -> HybridPredictor -> RegimeGate
+                 -> MonteCarloModule -> AutoFix
+                 -> ForecastResult
 
 Usage:
     from scripts.forecaster.engine import Forecaster
@@ -44,6 +59,15 @@ from .modules import (
     MonteCarloModule,
     CrowdPriorModule,
 )
+
+# Ultimate-fix imports
+from .ml_models import HybridPredictor, TemporalFeatureExtractor
+from .regime_gate import RegimeGate, ArbitrageDetector, should_trade, GateDecision
+from .auto_fix import AutoFixPipeline, CalibrationSuite
+
+# Particle candle + manifold pattern imports
+from .particle_candles import ParticleCandleModule, ParticleCandleBuilder, EventBar, EventBarSequence
+from .manifold_patterns import ManifoldPatternModule, ManifoldPatternDetector, PatternDetection
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -183,7 +207,11 @@ class ForecastResult:
 
 class Forecaster:
     """
-    12-paradigm ensemble forecaster with regime gating.
+    14-paradigm ensemble forecaster with regime gating.
+
+    Paradigms 1-12: original ensemble (technical, classical, macro, etc.)
+    Paradigm 13: Particle candle analysis (event-quantized bars + simplex geometry)
+    Paradigm 14: Manifold pattern detection (motif clustering + classical mapping)
 
     Usage:
         fc = Forecaster()
@@ -198,7 +226,12 @@ class Forecaster:
                  mc_iterations: int = 50_000,
                  mc_steps: int = 48,
                  mc_seed: int = 42,
-                 enable_mc: bool = True):
+                 enable_mc: bool = True,
+                 enable_regime_gate: bool = True,
+                 enable_hybrid_ml: bool = True,
+                 enable_auto_fix: bool = True,
+                 enable_particle_candles: bool = True,
+                 enable_manifold_patterns: bool = True):
         # ── Instantiate all modules ───────────────────────
         self.technical = TechnicalModule()
         self.classical = ClassicalStatsModule()
@@ -215,11 +248,31 @@ class Forecaster:
         self.meta_learner = MetaLearnerModule()
         self.monte_carlo = MonteCarloModule()
 
+        # ── Ultimate-fix: enhanced modules ─────────────────
+        self.hybrid_predictor = HybridPredictor()
+        self.regime_gate = RegimeGate()
+        self.auto_fix = AutoFixPipeline()
+        self.arb_detector = ArbitrageDetector()
+        self._temporal_extractor = TemporalFeatureExtractor(lookback=48)
+
+        # ── Particle candle + manifold pattern modules ────
+        self.particle_candle = ParticleCandleModule(
+            rule="adaptive", window_sizes=(20, 40),
+        )
+        self.manifold_pattern = ManifoldPatternModule(
+            window=30, candle_rule="adaptive",
+        )
+
         # Config
         self.mc_iterations = mc_iterations
         self.mc_steps = mc_steps
         self.mc_seed = mc_seed
         self.enable_mc = enable_mc
+        self.enable_regime_gate = enable_regime_gate
+        self.enable_hybrid_ml = enable_hybrid_ml
+        self.enable_auto_fix = enable_auto_fix
+        self.enable_particle_candles = enable_particle_candles
+        self.enable_manifold_patterns = enable_manifold_patterns
 
         # All predictive modules (order matters for feature flow)
         self._modules = [
@@ -324,6 +377,100 @@ class Forecaster:
         # Assign regime info to ensemble targets
         ensemble_targets.regime = dominant
         ensemble_targets.regime_probs = regime_probs
+
+        # ── Step 4a2: Particle candle module ────────────────
+        if self.enable_particle_candles and len(snap.bars_1h) >= 20:
+            try:
+                pc_out = self.particle_candle.predict(snap, horizon_hours)
+                if pc_out.confidence > 0:
+                    module_outputs.append(pc_out)
+                    result.module_outputs[pc_out.module_name] = {
+                        "confidence": round(pc_out.confidence, 4),
+                        "direction_prob": round(pc_out.targets.direction_prob, 4),
+                        "expected_return": round(pc_out.targets.expected_return, 6),
+                        "volatility": round(pc_out.targets.volatility_forecast, 6),
+                        "n_event_bars": pc_out.metadata.get("n_event_bars", 0),
+                        "elapsed_ms": round(pc_out.elapsed_ms, 2),
+                    }
+            except Exception as e:
+                result.module_outputs["particle_candle"] = {"error": str(e)}
+
+        # ── Step 4a3: Manifold pattern module ──────────────
+        if self.enable_manifold_patterns and len(snap.bars_1h) >= 20:
+            try:
+                mp_out = self.manifold_pattern.predict(snap, horizon_hours)
+                if mp_out.confidence > 0:
+                    module_outputs.append(mp_out)
+                    result.module_outputs[mp_out.module_name] = {
+                        "confidence": round(mp_out.confidence, 4),
+                        "direction_prob": round(mp_out.targets.direction_prob, 4),
+                        "expected_return": round(mp_out.targets.expected_return, 6),
+                        "pattern": mp_out.metadata.get("pattern", "none"),
+                        "breakout_bias": mp_out.metadata.get("breakout_bias", "neutral"),
+                        "match_score": mp_out.metadata.get("match_score", 0),
+                        "elapsed_ms": round(mp_out.elapsed_ms, 2),
+                    }
+            except Exception as e:
+                result.module_outputs["manifold_pattern"] = {"error": str(e)}
+
+        # ── Step 4b: Hybrid ML enhancement ────────────────
+        if self.enable_hybrid_ml and snap.closes:
+            try:
+                temporal_feats = self._temporal_extractor.extract(
+                    snap.closes, snap.volumes, snap.highs, snap.lows
+                )
+                all_features = MetaLearnerModule._extract_features(module_outputs)
+                for k, v in temporal_feats.items():
+                    all_features[f"temporal__{k}"] = v
+
+                self.hybrid_predictor.maybe_retrain()
+                hybrid_pred = self.hybrid_predictor.predict(all_features)
+                if hybrid_pred is not None:
+                    h_w = 0.40
+                    m_w = 1.0 - h_w
+                    ensemble_targets.direction_prob = (
+                        h_w * hybrid_pred["direction_prob"]
+                        + m_w * ensemble_targets.direction_prob
+                    )
+                    ensemble_targets.expected_return = (
+                        h_w * hybrid_pred["expected_return"]
+                        + m_w * ensemble_targets.expected_return
+                    )
+                    result.module_outputs["hybrid_ml"] = {
+                        "confidence": round(hybrid_pred["confidence"], 4),
+                        "direction_prob": round(hybrid_pred["direction_prob"], 4),
+                        "n_train_samples": hybrid_pred["n_train_samples"],
+                    }
+            except Exception as e:
+                result.module_outputs["hybrid_ml"] = {"error": str(e)}
+
+        # ── Step 4c: Regime gating ─────────────────────────
+        gate_decision = None
+        if self.enable_regime_gate:
+            try:
+                gate_decision = self.regime_gate.apply(
+                    ensemble_targets, regime_probs
+                )
+                result.module_outputs["regime_gate"] = {
+                    "action": gate_decision.action,
+                    "tier": gate_decision.tier,
+                    "original_dir_prob": round(gate_decision.original_direction_prob, 4),
+                    "gated_dir_prob": round(gate_decision.gated_direction_prob, 4),
+                    "multiplier": round(gate_decision.confidence_multiplier, 4),
+                }
+            except Exception as e:
+                result.module_outputs["regime_gate"] = {"error": str(e)}
+
+        # ── Step 4d: Auto-calibration ──────────────────────
+        if self.enable_auto_fix:
+            try:
+                cal_prob = self.auto_fix.calibrate_prob(
+                    ensemble_targets.direction_prob
+                )
+                if cal_prob != ensemble_targets.direction_prob:
+                    ensemble_targets.direction_prob = cal_prob
+            except Exception:
+                pass
 
         result.targets = ensemble_targets
 
@@ -495,7 +642,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Crypto Forecaster -- 12-Paradigm Ensemble"
+        description="Crypto Forecaster -- 14-Paradigm Ensemble"
     )
     parser.add_argument("--symbol", "-s", default="BTCUSDT",
                         help="Symbol to forecast (default: BTCUSDT)")
@@ -521,7 +668,7 @@ def main():
         enable_mc=not args.no_mc,
     )
 
-    print(f"Running 12-paradigm ensemble forecast for {args.symbol} "
+    print(f"Running 14-paradigm ensemble forecast for {args.symbol} "
           f"(horizon={args.horizon}h)...")
     print(f"Monte Carlo: {'ON' if not args.no_mc else 'OFF'} "
           f"({args.mc_iterations:,} iterations)")
@@ -557,7 +704,7 @@ def _print_report(r: ForecastResult):
     print(f"{'='*64}")
     print(f"  Timestamp:        {r.timestamp}")
     print(f"  Horizon:          {r.horizon_hours}h")
-    print(f"  Modules Run:      {r.modules_run}/12")
+    print(f"  Modules Run:      {r.modules_run}/14")
     print(f"  Elapsed:          {r.elapsed_ms:.1f}ms")
     print(f"{'─'*64}")
     print(f"  Current Price:    ${r.current_price:>12,.2f}")

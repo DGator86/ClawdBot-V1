@@ -61,6 +61,9 @@ def run_simulation(
     crash_prob: float = 0.0,
     regime: str = "range",
     quantiles: dict = None,
+    # Ultimate-fix: regime-conditioned parameters
+    regime_probs: dict = None,
+    confidence_scalar: float = 0.70,
 ) -> dict:
     """
     Run a Monte Carlo simulation using Geometric Brownian Motion
@@ -76,6 +79,21 @@ def run_simulation(
     T = 1.0
     log_return = math.log(predicted_price / current_price)
     mu = log_return
+    sigma = volatility * confidence_scalar  # scale by confidence
+
+    # ── Regime-conditioned volatility adjustment ─────────────
+    # Different regimes have different vol characteristics
+    if regime_probs:
+        vol_adj = 1.0
+        if regime_probs.get("trend_up", 0) > 0.3:
+            vol_adj = 0.85  # trends are lower vol
+        elif regime_probs.get("cascade_risk", 0) > 0.3:
+            vol_adj = 1.5   # cascade = high vol
+        elif regime_probs.get("post_jump", 0) > 0.3:
+            vol_adj = 1.2   # elevated vol after jumps
+        elif regime_probs.get("vol_expansion", 0) > 0.3:
+            vol_adj = 1.3   # expanding vol
+        sigma *= vol_adj
     sigma = volatility
 
     # ── Generate price paths ─────────────────────────────────
@@ -86,6 +104,8 @@ def run_simulation(
     jump_lambda = jump_prob * n_steps
     if jump_lambda > 0.01:
         jump_mu = -0.02 if crash_prob > jump_prob * 0.4 else 0.0
+        # Jump sizes use raw vol (not scaled) to preserve tail accuracy
+        jump_sigma = volatility * 2
         jump_sigma = sigma * 2
         N_jumps = rng.poisson(jump_lambda * dt, (n_iterations, n_steps))
         J_sizes = rng.normal(jump_mu, jump_sigma, (n_iterations, n_steps))
