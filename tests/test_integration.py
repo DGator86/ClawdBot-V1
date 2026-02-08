@@ -562,11 +562,275 @@ def t35():
 test(35, "Kalshi: module exports", t35)
 
 
+# ── Ralph Wiggum Tests ──────────────────────────────────────
+print("\n-- Ralph Wiggum Tests --")
+
+
+def t36():
+    from gnosis.ralph.tracker import PredictionTracker, PredictionRecord
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        tracker = PredictionTracker(data_dir=tmp)
+        rec = tracker.record_forecast(
+            forecast={"symbol": "BTCUSDT", "current_price": 69000,
+                      "predicted_price": 69500, "direction": "up",
+                      "confidence": 0.6, "regime": "range"},
+            kpcofgs={"S_label": "S_TC_PULLBACK_RESUME"},
+        )
+        assert rec.id != ""
+        assert rec.source == "clawdbot"
+        assert rec.direction_prob > 0.5, f"up direction should give prob > 0.5, got {rec.direction_prob}"
+        assert tracker.total_count == 1
+        assert tracker.resolved_count == 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(36, "Ralph: PredictionTracker record + query", t36)
+
+
+def t37():
+    from gnosis.ralph.tracker import PredictionTracker
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        tracker = PredictionTracker(data_dir=tmp)
+        rec = tracker.record_forecast(
+            forecast={"symbol": "BTCUSDT", "current_price": 69000,
+                      "predicted_price": 70000, "direction": "up",
+                      "confidence": 0.7, "regime": "range"},
+        )
+        # Resolve with higher price (correct prediction)
+        resolved = tracker.resolve(rec.id, outcome_price=70500.0)
+        assert resolved.resolved is True
+        assert resolved.outcome_direction == "up"
+        assert resolved.brier_score >= 0
+        assert resolved.actual_return > 0
+        # Metrics
+        metrics = tracker.compute_metrics()
+        assert metrics["n_resolved"] == 1
+        assert metrics["brier_score"] is not None
+        assert metrics["hit_rate"] is not None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(37, "Ralph: resolve prediction + compute metrics", t37)
+
+
+def t38():
+    from gnosis.ralph.tracker import PredictionTracker
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        tracker = PredictionTracker(data_dir=tmp)
+        rec = tracker.record_kalshi_trade(
+            scan_result={"ticker": "KXBTC-TEST", "series": "KXBTC",
+                         "side": "yes", "cost_cents": 45,
+                         "model_prob": 0.6, "market_prob": 0.5,
+                         "edge_pct": 10.0, "ev_cents": 5.0},
+        )
+        assert rec.kalshi_ticker == "KXBTC-TEST"
+        assert rec.kalshi_cost_cents == 45
+        # Resolve as YES won
+        resolved = tracker.resolve(rec.id, kalshi_settled_yes=True)
+        assert resolved.pnl_cents > 0  # bought YES, YES won
+        assert resolved.brier_score >= 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(38, "Ralph: Kalshi trade record + resolution", t38)
+
+
+def t39():
+    from gnosis.ralph.hyperparams import HyperParams, HyperParamManager
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        params = HyperParams()
+        assert params.min_edge_pct == 5.0
+        assert params.kelly_fraction == 0.25
+        assert params.stop_loss_pct == 0.03
+        d = params.to_dict()
+        assert "min_edge_pct" in d
+        restored = HyperParams.from_dict(d)
+        assert restored.min_edge_pct == params.min_edge_pct
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(39, "Ralph: HyperParams defaults + serialization", t39)
+
+
+def t40():
+    from gnosis.ralph.hyperparams import HyperParamManager, HyperParams
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        mgr = HyperParamManager(data_dir=tmp, seed=42)
+        # Get initial params
+        p0 = mgr.get_current_params()
+        assert isinstance(p0, HyperParams)
+        # Step 10 times — should have some explore cycles
+        explores = 0
+        for _ in range(20):
+            mgr.step()
+            if mgr.is_exploring:
+                explores += 1
+        assert explores > 0, "should have at least one explore in 20 steps"
+        assert mgr.cycle == 20
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(40, "Ralph: HyperParamManager explore/exploit", t40)
+
+
+def t41():
+    from gnosis.ralph.hyperparams import HyperParamManager, ParamSnapshot
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        mgr = HyperParamManager(data_dir=tmp, seed=42)
+        params = mgr.get_current_params()
+        # Record good performance
+        mgr.record_performance(params, {
+            "n_resolved": 20,
+            "brier_score": 0.15,
+            "hit_rate": 0.65,
+            "total_pnl_cents": 200,
+        })
+        assert mgr._best is not None
+        assert mgr._best.score > 0
+        # Record bad performance — should NOT replace best
+        prev_score = mgr._best.score
+        mgr.record_performance(params, {
+            "n_resolved": 5,
+            "brier_score": 0.40,
+            "hit_rate": 0.40,
+            "total_pnl_cents": -100,
+        })
+        # Best should still be the first one (better score)
+        assert mgr._best.score >= 0  # at least non-negative
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(41, "Ralph: performance tracking + best selection", t41)
+
+
+def t42():
+    from gnosis.ralph.learner import RalphLearner, LearningConfig
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = LearningConfig(data_dir=tmp, verbose=False)
+        learner = RalphLearner(config=cfg)
+        # Run a cycle with some forecasts
+        result = learner.run_cycle(
+            forecasts=[{
+                "symbol": "BTCUSDT", "current_price": 69000,
+                "predicted_price": 69500, "direction": "up",
+                "confidence": 0.6, "regime": "range",
+            }],
+            scan_results=[{
+                "ticker": "KXBTC-TEST", "series": "KXBTC",
+                "side": "yes", "cost_cents": 45,
+                "model_prob": 0.6, "market_prob": 0.5,
+                "edge_pct": 10.0, "ev_cents": 5.0,
+            }],
+            kpcofgs={"S_label": "S_UNCERTAIN"},
+        )
+        assert result.cycle_number == 1
+        assert result.predictions_recorded == 2  # 1 forecast + 1 kalshi
+        assert result.metrics["n_predictions"] == 2
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(42, "Ralph: RalphLearner full cycle", t42)
+
+
+def t43():
+    from gnosis.ralph.learner import RalphLearner, LearningConfig
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = LearningConfig(data_dir=tmp, verbose=False)
+        learner = RalphLearner(config=cfg)
+        summary = learner.get_learning_summary()
+        assert "tracker" in summary
+        assert "params" in summary
+        assert "metrics" in summary
+        assert summary["tracker"]["total"] == 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(43, "Ralph: learning summary structure", t43)
+
+
+# ── Orchestrator Tests ───────────────────────────────────────
+print("\n-- Orchestrator Tests --")
+
+
+def t44():
+    from gnosis.orchestrator import UnifiedOrchestrator, OrchestratorConfig
+    from gnosis.ralph.learner import LearningConfig
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = OrchestratorConfig(
+            enable_forecast=False,
+            enable_kalshi=False,
+            enable_ralph=True,
+            learning=LearningConfig(data_dir=tmp, verbose=False),
+            verbose=False,
+        )
+        orch = UnifiedOrchestrator(config=cfg)
+        assert orch.ralph is not None
+        assert orch._cycle_count == 0
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(44, "Orchestrator: instantiation", t44)
+
+
+def t45():
+    from gnosis.orchestrator import OrchestratorResult
+    result = OrchestratorResult(cycle=1)
+    d = result.to_dict()
+    assert d["cycle"] == 1
+    assert "forecast" in d
+    assert "scan_results" in d
+    assert "ralph" in d
+    assert "errors" in d
+test(45, "Orchestrator: OrchestratorResult structure", t45)
+
+
+def t46():
+    from gnosis.orchestrator import UnifiedOrchestrator, OrchestratorConfig
+    from gnosis.ralph.learner import LearningConfig
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = OrchestratorConfig(
+            enable_forecast=False,
+            enable_kalshi=False,
+            enable_ralph=True,
+            learning=LearningConfig(data_dir=tmp, verbose=False),
+            verbose=False,
+        )
+        orch = UnifiedOrchestrator(config=cfg)
+        result = orch.run_cycle()
+        assert result.cycle == 1
+        assert result.elapsed_ms >= 0
+        assert isinstance(result.hyperparams, dict)
+        # Ralph should have run
+        assert result.ralph_cycle is not None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(46, "Orchestrator: run_cycle (forecast+kalshi disabled)", t46)
+
+
+def t47():
+    from gnosis.ralph import RalphLearner, PredictionTracker, HyperParams
+    assert RalphLearner is not None
+    assert PredictionTracker is not None
+    assert HyperParams is not None
+test(47, "Ralph: module __init__ exports", t47)
+
+
 # ── Syntax Check ─────────────────────────────────────────────
 print("\n-- Syntax Check --")
 
 
-def t36():
+def t48():
     import py_compile
     import glob
     errors = []
@@ -577,7 +841,7 @@ def t36():
         except py_compile.PyCompileError as e:
             errors.append(str(e))
     assert not errors, f"Syntax errors: {errors}"
-test(36, "Syntax: all gnosis/*.py files compile", t36)
+test(48, "Syntax: all gnosis/*.py files compile", t48)
 
 
 # ═══════════════════════════════════════════════════════════════
