@@ -46,10 +46,17 @@ print("\n-- LLM Config Tests --")
 
 
 def t1():
-    from gnosis.reasoning.client import LLMConfig
-    cfg = LLMConfig.from_yaml()
-    assert cfg._environment in ("stub", "genspark_unresolved"), \
-        f"got {cfg._environment}"
+    from gnosis.reasoning.client import LLMConfig, _load_dotenv
+    import gnosis.reasoning.client as _client_mod
+    # Patch _load_dotenv to return empty (test must be isolated from .env files)
+    orig_dotenv = _client_mod._load_dotenv
+    _client_mod._load_dotenv = lambda path=None: {}
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment in ("stub", "genspark_unresolved"), \
+            f"got {cfg._environment}"
+    finally:
+        _client_mod._load_dotenv = orig_dotenv
 test(1, "LLM Config: no key -> stub/unresolved", t1)
 
 
