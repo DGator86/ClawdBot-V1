@@ -826,11 +826,238 @@ def t47():
 test(47, "Ralph: module __init__ exports", t47)
 
 
+# ── Telegram Bot Tests ──────────────────────────────────────
+print("\n-- Telegram Bot Tests --")
+
+
+def t49():
+    from gnosis.telegram import TelegramBot, MessageFormatter
+    assert TelegramBot is not None
+    assert MessageFormatter is not None
+test(49, "Telegram: module exports", t49)
+
+
+def t50():
+    from gnosis.telegram.formatter import MessageFormatter, _esc
+    # Escape special MarkdownV2 characters
+    assert "\\" in _esc("hello.world")
+    assert "\\" in _esc("test_underscore")
+    assert "\\" in _esc("*bold*")
+    # Safe text should have no added escapes (only letters/digits)
+    assert _esc("hello") == "hello"
+test(50, "Telegram: MarkdownV2 escaping", t50)
+
+
+def t51():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    # cycle_report with a mock result dict
+    result = {
+        "cycle": 5,
+        "forecast": {
+            "symbol": "BTCUSDT",
+            "current_price": 69000,
+            "predicted_price": 69500,
+            "direction": "up",
+            "confidence": 0.62,
+            "regime": "range",
+        },
+        "kpcofgs": {"K_label": "TRENDING", "S_label": "NEUTRAL", "regime_entropy": 0.42},
+        "scan_results": [{"ticker": "T1"}],
+        "buy_count": 1,
+        "watch_count": 0,
+        "ralph": {
+            "cycle_number": 5,
+            "mode": "exploit",
+            "metrics": {"n_predictions": 10, "n_resolved": 3, "brier_score": 0.22, "hit_rate": 0.67},
+        },
+        "elapsed_ms": 1234,
+    }
+    msg = fmt.cycle_report(result)
+    assert "Cycle 5" in msg
+    assert "BTCUSDT" in msg or "Forecast" in msg
+    assert "Ralph" in msg or "ralph" in msg.lower()
+    # Should be a string
+    assert isinstance(msg, str)
+    assert len(msg) > 50
+test(51, "Telegram: cycle_report formatting", t51)
+
+
+def t52():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    vp = {
+        "scan": {
+            "ticker": "KXBTC-26FEB08-T70000",
+            "side": "yes",
+            "cost_cents": 45,
+            "edge_pct": 10.5,
+            "ev_cents": 5.2,
+            "minutes_to_expiry": 42,
+        },
+        "value_score": 7.5,
+        "risk_level": "MODERATE",
+        "suggested_size": 3,
+        "max_loss": 1.35,
+        "reasoning": "High edge with moderate confidence.",
+    }
+    msg = fmt.buy_alert(vp)
+    assert "BUY" in msg
+    assert "KXBTC" in msg
+    assert isinstance(msg, str)
+    assert len(msg) > 30
+test(52, "Telegram: buy_alert formatting", t52)
+
+
+def t53():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    msg = fmt.status_report(
+        llm_info={"environment": "openrouter", "model": "llama-3.3-70b"},
+        ralph_summary={
+            "params": {"cycle": 10, "is_exploring": False, "best_score": 0.35},
+            "tracker": {"total": 20, "resolved": 8},
+            "metrics": {"brier_score": 0.20, "hit_rate": 0.65, "total_pnl_cents": 150},
+        },
+        kalshi_status={"exchange_active": True, "trading_active": True},
+    )
+    assert "Status" in msg
+    assert "Ralph" in msg
+    assert "Kalshi" in msg
+    assert isinstance(msg, str)
+test(53, "Telegram: status_report formatting", t53)
+
+
+def t54():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    summary = {
+        "params": {"cycle": 15, "is_exploring": True, "best_score": 0.42, "history_size": 5},
+        "metrics": {"brier_score": 0.18, "hit_rate": 0.70, "total_pnl_cents": 250, "n_kalshi_trades": 12},
+        "tracker": {"total": 30, "resolved": 15},
+    }
+    msg = fmt.ralph_report(summary)
+    assert "Ralph" in msg
+    assert "Learning" in msg or "Cycle" in msg
+    assert isinstance(msg, str)
+test(54, "Telegram: ralph_report formatting", t54)
+
+
+def t55():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    msg = fmt.help_message()
+    assert "/scan" in msg
+    assert "/status" in msg
+    assert "/ralph" in msg
+    assert "/params" in msg
+    assert "/help" in msg
+test(55, "Telegram: help_message lists all commands", t55)
+
+
+def t56():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    # Plain text fallbacks
+    result = {
+        "cycle": 2,
+        "forecast": {
+            "symbol": "ETHUSDT", "current_price": 3000,
+            "predicted_price": 3100, "direction": "up",
+            "confidence": 0.55,
+        },
+        "scan_results": [{"ticker": "T1"}],
+        "buy_count": 1,
+        "watch_count": 0,
+        "value_plays": [
+            {"scan": {"ticker": "KXETH-T3100", "edge_pct": 8.2}, "recommendation": "BUY"},
+        ],
+        "ralph": {"cycle_number": 2, "mode": "explore", "metrics": {}},
+        "elapsed_ms": 567,
+    }
+    plain = fmt.cycle_report_plain(result)
+    assert "Cycle 2" in plain
+    assert "ETHUSDT" in plain or "Forecast" in plain
+    assert isinstance(plain, str)
+
+    vp_plain = fmt.buy_alert_plain({
+        "scan": {"ticker": "KXBTC-TEST", "side": "yes", "cost_cents": 40, "edge_pct": 12.0, "ev_cents": 6.0},
+        "value_score": 8.0,
+        "suggested_size": 2,
+        "reasoning": "Strong edge.",
+    })
+    assert "BUY" in vp_plain
+    assert "KXBTC" in vp_plain
+test(56, "Telegram: plain text fallback formatting", t56)
+
+
+def t57():
+    from gnosis.telegram.bot import TelegramBot, TelegramAPI
+    # TelegramBot without token should be inert
+    bot = TelegramBot(token="", chat_id="")
+    assert bot.api is None
+    assert bot.send_text("test") is False
+    assert bot.send_plain("test") is False
+test(57, "Telegram: TelegramBot inert without token", t57)
+
+
+def t58():
+    from gnosis.telegram.bot import TelegramBot
+    # Bot with token but no chat_id should create API
+    bot = TelegramBot(token="123456:ABCtest", chat_id="")
+    assert bot.api is not None
+    assert bot.chat_id == ""
+    # send_text should fail gracefully (no chat_id)
+    assert bot.send_text("test") is False
+test(58, "Telegram: TelegramBot with token but no chat_id", t58)
+
+
+def t59():
+    from gnosis.telegram.bot import TelegramBot
+    from gnosis.orchestrator import OrchestratorConfig, UnifiedOrchestrator
+    from gnosis.ralph.learner import LearningConfig
+    import tempfile, shutil
+    tmp = tempfile.mkdtemp()
+    try:
+        cfg = OrchestratorConfig(
+            enable_forecast=False,
+            enable_kalshi=False,
+            enable_ralph=True,
+            learning=LearningConfig(data_dir=tmp, verbose=False),
+            verbose=False,
+        )
+        orch = UnifiedOrchestrator(config=cfg)
+        bot = TelegramBot(
+            token="123456:ABCtest",
+            chat_id="12345",
+            orchestrator=orch,
+            notify_on_buy=True,
+            notify_on_cycle=False,
+        )
+        assert bot.orchestrator is orch
+        assert bot.notify_on_buy is True
+        assert bot.notify_on_cycle is False
+        assert bot._last_cycle_result is None
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+test(59, "Telegram: TelegramBot wired to orchestrator", t59)
+
+
+def t60():
+    from gnosis.telegram.formatter import MessageFormatter
+    fmt = MessageFormatter()
+    msg = fmt.error_message("Something went wrong: connection refused")
+    assert "Error" in msg
+    assert "Something" in msg
+    assert isinstance(msg, str)
+test(60, "Telegram: error_message formatting", t60)
+
+
 # ── Syntax Check ─────────────────────────────────────────────
 print("\n-- Syntax Check --")
 
 
-def t48():
+def t61():
     import py_compile
     import glob
     errors = []
@@ -841,7 +1068,7 @@ def t48():
         except py_compile.PyCompileError as e:
             errors.append(str(e))
     assert not errors, f"Syntax errors: {errors}"
-test(48, "Syntax: all gnosis/*.py files compile", t48)
+test(61, "Syntax: all gnosis/*.py files compile", t61)
 
 
 # ═══════════════════════════════════════════════════════════════
