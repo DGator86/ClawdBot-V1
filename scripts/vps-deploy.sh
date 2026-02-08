@@ -64,7 +64,7 @@ if ! grep -q '^TELEGRAM_BOT_TOKEN=' "${ENV_FILE}" 2>/dev/null; then
     cat >> "${ENV_FILE}" << 'TGBLOCK'
 
 # ── Telegram Bot (@KalshiYoshiBot) ──
-TELEGRAM_BOT_TOKEN=8501633363:AAHj9PSpgTG9Adl6f5hGnl-IlS3184rii7E
+TELEGRAM_BOT_TOKEN=8501633363:AAFDTd4U3S_qoCKVN2Y6m0D7v_qePVuUnnI
 TGBLOCK
     echo "  ✓ Telegram bot token added"
 else
@@ -136,7 +136,7 @@ print(f'  ✓ LLM routing: env={cfg._environment}, model={cfg.model}')
 python3 -c "
 import json
 from urllib import request as urlreq
-url = 'https://api.telegram.org/bot8501633363:AAHj9PSpgTG9Adl6f5hGnl-IlS3184rii7E/getMe'
+url = 'https://api.telegram.org/bot8501633363:AAFDTd4U3S_qoCKVN2Y6m0D7v_qePVuUnnI/getMe'
 with urlreq.urlopen(url, timeout=10) as resp:
     data = json.loads(resp.read().decode())
     if data.get('ok'):
