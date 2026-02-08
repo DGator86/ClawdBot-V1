@@ -73,6 +73,15 @@ TGBLOCK
     echo "  ✓ Telegram bot token added"
 fi
 
+# Set Telegram chat ID
+YOSHI_CHAT_ID="8236163940"
+if grep -q '^TELEGRAM_CHAT_ID=' "${ENV_FILE}" 2>/dev/null; then
+    sed -i "s|^TELEGRAM_CHAT_ID=.*|TELEGRAM_CHAT_ID=${YOSHI_CHAT_ID}|" "${ENV_FILE}"
+else
+    echo "TELEGRAM_CHAT_ID=${YOSHI_CHAT_ID}" >> "${ENV_FILE}"
+fi
+echo "  ✓ Telegram chat ID configured"
+
 # Check Kalshi credentials
 if [ -n "${EXISTING_KALSHI_KEY_ID}" ] && [ "${EXISTING_KALSHI_KEY_ID}" != "your_kalshi_key_id_here" ]; then
     echo "  ✓ Kalshi key ID found: ${EXISTING_KALSHI_KEY_ID:0:12}..."
