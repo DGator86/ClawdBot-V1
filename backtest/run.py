@@ -4,25 +4,118 @@ import argparse
 import json
 import os
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
-from mtf.backtest_engine import BacktestConfig, build_dataset, walk_forward_backtest
+from mtf.backtest_engine import BacktestConfig, build_dataset, compute_metrics, walk_forward_backtest
 from mtf.constants import PRIMARY_TARGET_TF, TF_LIST, WINDOW_BARS
 from mtf.data_provider import get_multi_timeframe_candles
 
 
-def _run_for_symbol(symbol: str, config: BacktestConfig, window: int) -> Dict[str, pd.DataFrame]:
+def _parse_iso_timestamp(value: str) -> pd.Timestamp:
+    ts = pd.to_datetime(value, utc=True)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize(timezone.utc)
+    return ts
+
+
+def _parse_ranges(ranges_arg: Optional[str]) -> Optional[List[Tuple[pd.Timestamp, pd.Timestamp]]]:
+    if not ranges_arg:
+        return None
+    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
+    raw_ranges = [item.strip() for item in ranges_arg.split(",") if item.strip()]
+    for raw_range in raw_ranges:
+        if ":" not in raw_range:
+            raise ValueError(f"Invalid range '{raw_range}'. Expected start:end format.")
+        start_str, end_str = [part.strip() for part in raw_range.split(":", 1)]
+        if not start_str or not end_str:
+            raise ValueError(f"Invalid range '{raw_range}'. Expected start:end format.")
+        start_ts = _parse_iso_timestamp(start_str)
+        end_ts = _parse_iso_timestamp(end_str)
+        if start_ts >= end_ts:
+            raise ValueError(f"Invalid range '{raw_range}'. Start must be before end.")
+        ranges.append((start_ts, end_ts))
+    return ranges
+
+
+def _filter_by_range(
+    bars_by_tf: Dict[str, pd.DataFrame],
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> Dict[str, pd.DataFrame]:
+    filtered: Dict[str, pd.DataFrame] = {}
+    for tf, df in bars_by_tf.items():
+        if df.empty:
+            filtered[tf] = df
+            continue
+        mask = (df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)
+        filtered[tf] = df.loc[mask].reset_index(drop=True)
+    return filtered
+
+
+def _run_for_symbol(
+    symbol: str,
+    config: BacktestConfig,
+    window: int,
+    ranges: Optional[List[Tuple[pd.Timestamp, pd.Timestamp]]],
+) -> Dict[str, pd.DataFrame]:
     bars_by_tf = get_multi_timeframe_candles(symbol, limit=window)
-    feature_df, label_series = build_dataset(bars_by_tf, target_tf=config.target_tf)
-    results = walk_forward_backtest(feature_df, label_series, config)
+    if not ranges:
+        feature_df, label_series = build_dataset(bars_by_tf, target_tf=config.target_tf)
+        results = walk_forward_backtest(feature_df, label_series, config)
+        return {
+            "features": feature_df,
+            "labels": label_series,
+            "predictions": results.predictions,
+            "metrics": results.metrics,
+            "per_regime": results.per_regime,
+        }
+
+    range_payloads = []
+    combined_predictions: List[pd.DataFrame] = []
+    for idx, (start_ts, end_ts) in enumerate(ranges, start=1):
+        ranged_bars = _filter_by_range(bars_by_tf, start_ts, end_ts)
+        feature_df, label_series = build_dataset(ranged_bars, target_tf=config.target_tf)
+        if feature_df.empty or len(feature_df) <= config.train_window:
+            range_payloads.append(
+                {
+                    "range": {
+                        "start": start_ts.isoformat(),
+                        "end": end_ts.isoformat(),
+                    },
+                    "error": "Not enough data for walk-forward backtest.",
+                }
+            )
+            continue
+        results = walk_forward_backtest(feature_df, label_series, config)
+        combined_predictions.append(results.predictions)
+        range_payloads.append(
+            {
+                "range": {
+                    "start": start_ts.isoformat(),
+                    "end": end_ts.isoformat(),
+                },
+                "metrics": results.metrics,
+                "per_regime": results.per_regime,
+            }
+        )
+
+    if combined_predictions:
+        merged_predictions = pd.concat(combined_predictions).sort_index()
+        merged_features, _ = build_dataset(bars_by_tf, target_tf=config.target_tf)
+        agg_metrics, agg_regime = compute_metrics(merged_predictions, merged_features)
+    else:
+        merged_predictions = pd.DataFrame(columns=["prob_up", "target"]).astype(float)
+        agg_metrics, agg_regime = {}, {}
+
     return {
-        "features": feature_df,
-        "labels": label_series,
-        "predictions": results.predictions,
-        "metrics": results.metrics,
-        "per_regime": results.per_regime,
+        "features": pd.DataFrame(),
+        "labels": pd.Series(dtype=int),
+        "predictions": merged_predictions,
+        "metrics": agg_metrics,
+        "per_regime": agg_regime,
+        "ranges": range_payloads,
     }
 
 
@@ -33,6 +126,12 @@ def main() -> None:
     parser.add_argument("--window", type=int, default=WINDOW_BARS)
     parser.add_argument("--train_window", type=int, default=1000)
     parser.add_argument("--refit_every", type=int, default=10)
+    parser.add_argument(
+        "--ranges",
+        type=str,
+        default=None,
+        help="Comma-separated date ranges: start:end (UTC/ISO-8601).",
+    )
     parser.add_argument("--output_dir", type=str, default=None)
     args = parser.parse_args()
 
@@ -43,6 +142,8 @@ def main() -> None:
     run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_dir = args.output_dir or os.path.join("data", "backtests", run_id)
     os.makedirs(output_dir, exist_ok=True)
+
+    ranges = _parse_ranges(args.ranges)
 
     config = BacktestConfig(
         target_tf=args.target_tf,
@@ -58,19 +159,22 @@ def main() -> None:
             "window": args.window,
             "train_window": args.train_window,
             "refit_every": args.refit_every,
+            "ranges": args.ranges,
         },
         "results": {},
     }
 
     for symbol in symbols:
-        result = _run_for_symbol(symbol, config, args.window)
+        result = _run_for_symbol(symbol, config, args.window, ranges)
         pred_path = os.path.join(output_dir, f"{symbol.lower()}_predictions.parquet")
-        result["predictions"].to_parquet(pred_path)
+        if not result["predictions"].empty:
+            result["predictions"].to_parquet(pred_path)
 
         metrics = result["metrics"]
         summary["results"][symbol] = {
             "metrics": metrics,
             "per_regime": result["per_regime"],
+            "ranges": result.get("ranges"),
             "predictions_path": pred_path,
         }
 
