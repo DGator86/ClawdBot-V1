@@ -1,0 +1,483 @@
+#!/usr/bin/env python3
+"""
+Integration Test Suite — ClawdBot + Yoshi + Gnosis
+====================================================
+Verifies all gnosis components: LLM routing, Moltbot, PromptBuilder,
+bridge (KPCOFGS, scoring, walk-forward, backtest), particle physics,
+conformal calibration, and CLI wiring.
+
+Run:  cd /home/root/webapp && python3 tests/test_integration.py
+"""
+import sys
+import os
+import json
+import time
+
+# Ensure project root is on path
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+passed = failed = 0
+results = []
+
+
+def test(num, name, fn):
+    global passed, failed
+    try:
+        fn()
+        passed += 1
+        results.append((num, name, "PASS", ""))
+        print(f"  \u2713 {num}. {name}")
+    except Exception as e:
+        failed += 1
+        results.append((num, name, "FAIL", str(e)))
+        print(f"  \u2717 {num}. {name}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════
+# Save and clear env vars for isolated testing
+# ═══════════════════════════════════════════════════════════════
+saved_env = {}
+for k in ["OPENAI_API_KEY", "OPENAI_BASE_URL", "GENSPARK_TOKEN"]:
+    saved_env[k] = os.environ.pop(k, None)
+
+
+# ── LLM Config Tests ──────────────────────────────────────────
+print("\n-- LLM Config Tests --")
+
+
+def t1():
+    from gnosis.reasoning.client import LLMConfig
+    cfg = LLMConfig.from_yaml()
+    assert cfg._environment in ("stub", "genspark_unresolved"), \
+        f"got {cfg._environment}"
+test(1, "LLM Config: no key -> stub/unresolved", t1)
+
+
+def t2():
+    from gnosis.reasoning.client import LLMConfig
+    os.environ["OPENAI_API_KEY"] = "sk-proj-" + "a" * 100
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "openai_direct", f"got {cfg._environment}"
+        assert cfg.model == "gpt-4o-mini", f"got model {cfg.model}"
+        assert "api.openai.com" in cfg.base_url
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+test(2, "LLM Config: sk-* key -> openai_direct + gpt-4o-mini", t2)
+
+
+def t3():
+    from gnosis.reasoning.client import LLMConfig
+    os.environ["OPENAI_API_KEY"] = "sk-proj-" + "b" * 100
+    os.environ["OPENAI_BASE_URL"] = "https://my-custom-proxy.com/v1"
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "custom", f"got {cfg._environment}"
+        assert cfg.base_url == "https://my-custom-proxy.com/v1"
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+test(3, "LLM Config: sk-* + custom BASE_URL -> custom", t3)
+
+
+def t4():
+    from gnosis.reasoning.client import LLMConfig
+    os.environ["OPENAI_API_KEY"] = "sk-proj-" + "c" * 100
+    os.environ["OPENAI_BASE_URL"] = "https://www.genspark.ai/api/llm_proxy/v1"
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "openai_direct", f"got {cfg._environment}"
+        assert "api.openai.com" in cfg.base_url
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+test(4, "LLM Config: sk-* key + GenSpark URL -> override to openai_direct", t4)
+
+
+# ── LLM Client Tests ──────────────────────────────────────────
+print("\n-- LLM Client Tests --")
+
+
+def t5():
+    from gnosis.reasoning.client import LLMClient
+    client = LLMClient()
+    resp = client.chat("system", "user")
+    assert resp.is_stub, "expected stub response"
+    assert resp.parsed is not None
+    assert resp.parsed.get("is_stub") is True
+test(5, "LLM Client: stub response structure", t5)
+
+
+# ── Moltbot Tests ─────────────────────────────────────────────
+print("\n-- Moltbot Tests --")
+
+
+def t6():
+    from gnosis.execution.moltbot import load_moltbot_config
+    cfg_path = os.path.join(os.path.dirname(__file__), "..", "configs", "yoshi", "moltbot.yaml")
+    cfg = load_moltbot_config(os.path.abspath(cfg_path))
+    assert cfg is not None
+    assert hasattr(cfg, "ai")
+test(6, "Moltbot: YAML config loads", t6)
+
+
+def t7():
+    from gnosis.execution.moltbot import AIProviderConfig
+    ai_cfg = AIProviderConfig()
+    # endpoint and model start empty (auto-detected at runtime)
+    assert ai_cfg.provider == "openai"
+    assert ai_cfg.timeout_seconds == 60
+test(7, "Moltbot: AIProviderConfig defaults", t7)
+
+
+def t8():
+    from gnosis.execution.moltbot import AIProviderConfig, OpenAIChatClient
+    client = OpenAIChatClient(AIProviderConfig())
+    assert client is not None
+test(8, "Moltbot: OpenAIChatClient instantiation", t8)
+
+
+def t9():
+    from gnosis.execution.moltbot import AIProviderConfig
+    ai_cfg = AIProviderConfig()
+    endpoint = ai_cfg.resolve_endpoint()
+    model = ai_cfg.resolve_model()
+    assert endpoint  # should be non-empty
+    assert model  # should be non-empty
+    assert "chat/completions" in endpoint
+test(9, "Moltbot: endpoint/model resolution", t9)
+
+
+# ── PromptBuilder Tests ───────────────────────────────────────
+print("\n-- PromptBuilder Tests --")
+
+_FORECAST = {
+    "symbol": "BTCUSDT", "current_price": 69000, "predicted_price": 69500,
+    "confidence": 0.55, "regime": "range", "volatility": 0.03,
+    "var_95": 0.01, "var_99": 0.02, "direction": "long",
+    "gate_decision": {"action": "trade"}, "regime_probs": {},
+}
+_KPCOFGS = {"K": "TRENDING", "P": "MEAN_REVERTING"}
+
+
+def t10():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.full_analysis(_FORECAST, _KPCOFGS, "range", {}, {})
+    assert "BTCUSDT" in data
+    assert "KPCOFGS" in data
+test(10, "PromptBuilder: full_analysis includes symbol", t10)
+
+
+def t11():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.regime_deep_dive(_FORECAST, _KPCOFGS, "range")
+    assert "BTCUSDT" in data
+test(11, "PromptBuilder: regime_deep_dive includes symbol", t11)
+
+
+def t12():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.risk_assessment(_FORECAST, _KPCOFGS)
+    assert "BTCUSDT" in data
+test(12, "PromptBuilder: risk_assessment includes symbol", t12)
+
+
+def t13():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.trade_plan(_FORECAST, _KPCOFGS, "range", {}, 500, 2.0)
+    assert "BTCUSDT" in data
+test(13, "PromptBuilder: trade_plan includes symbol", t13)
+
+
+def t14():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.extrapolation(_FORECAST, _KPCOFGS, "range")
+    assert "BTCUSDT" in data
+test(14, "PromptBuilder: extrapolation includes symbol", t14)
+
+
+def t15():
+    from gnosis.reasoning.prompts import PromptBuilder
+    system, data = PromptBuilder.self_critique(
+        {"signal_quality": "MODERATE"}, _FORECAST, {}
+    )
+    assert "BTCUSDT" in data
+test(15, "PromptBuilder: self_critique includes symbol", t15)
+
+
+# ── UnifiedResult Tests ───────────────────────────────────────
+print("\n-- UnifiedResult Tests --")
+
+
+def t16():
+    from gnosis.bridge import UnifiedResult
+    r = UnifiedResult(
+        forecast={"a": 1}, kpcofgs={"K": "X"}, kpcofgs_regime="range",
+        validation={"ok": True}, backtest={"pnl": 100}, opportunities=[],
+        reasoning=None, elapsed_ms=1234.5,
+    )
+    d = r.to_dict()
+    assert d["kpcofgs_regime"] == "range"
+    assert d["elapsed_ms"] == 1234.5
+test(16, "UnifiedResult: serialization", t16)
+
+
+# ── KPCOFGS Tests ─────────────────────────────────────────────
+print("\n-- KPCOFGS Tests --")
+
+
+def t17():
+    from gnosis.bridge import classify_kpcofgs, kpcofgs_to_regime
+    import pandas as pd
+    import numpy as np
+    np.random.seed(42)
+    n = 500
+    close = np.cumsum(np.random.randn(n) * 0.01) + 100
+    df = pd.DataFrame({
+        "close": close,
+        "volume": np.random.rand(n) * 1000 + 100,
+        "high": close + np.random.rand(n) * 0.5,
+        "low": close - np.random.rand(n) * 0.5,
+    })
+    # classify_kpcofgs expects returns, realized_vol, range_pct, ofi, symbol
+    df["returns"] = df["close"].pct_change().fillna(0)
+    df["realized_vol"] = df["returns"].rolling(20, min_periods=5).std().fillna(0.01)
+    df["range_pct"] = ((df["high"] - df["low"]) / df["close"]).fillna(0)
+    df["ofi"] = 0.0
+    df["symbol"] = "BTCUSDT"
+
+    # classify_kpcofgs returns (enriched_df, summary_dict)
+    enriched_df, summary = classify_kpcofgs(df)
+    assert isinstance(summary, dict)
+    assert "K_label" in summary and "S_label" in summary
+
+    regime = kpcofgs_to_regime(summary)
+    assert isinstance(regime, str) and len(regime) > 0
+test(17, "KPCOFGS: classify + map to regime", t17)
+
+
+# ── Yoshi Scoring Tests ───────────────────────────────────────
+print("\n-- Yoshi Scoring Tests --")
+
+
+def t18():
+    from gnosis.bridge import score_forecast_series
+    import numpy as np
+    np.random.seed(42)
+    # score_forecast_series(forecasts: List[Dict], actuals: List[float])
+    n = 100
+    actuals = list(np.random.randn(n) * 0.01)
+    forecasts = [
+        {
+            "quantile_05": a - 0.02,
+            "quantile_50": a + np.random.randn() * 0.001,
+            "quantile_95": a + 0.02,
+            "direction_prob": 0.55 if a > 0 else 0.45,
+        }
+        for a in actuals
+    ]
+    scores = score_forecast_series(forecasts, actuals)
+    assert isinstance(scores, dict)
+    assert "pinball_05" in scores
+    assert "coverage_90" in scores
+    assert scores["n_samples"] == n
+test(18, "Yoshi: score_forecast_series", t18)
+
+
+# ── Walk-Forward Tests ────────────────────────────────────────
+print("\n-- Walk-Forward Tests --")
+
+
+def t19():
+    from gnosis.bridge import WalkForwardConfig
+    wf = WalkForwardConfig()
+    assert wf.n_outer_folds == 5
+    assert wf.purge_bars >= 0
+    assert wf.embargo_bars >= 0
+test(19, "WalkForward: config defaults", t19)
+
+
+# ── Backtest Tests ────────────────────────────────────────────
+print("\n-- Backtest Tests --")
+
+
+def t20():
+    from gnosis.bridge import BacktestConfig
+    bt = BacktestConfig()
+    assert bt.initial_capital > 0
+    assert bt.fee_pct >= 0
+    assert bt.position_size_pct > 0
+test(20, "Backtest: config defaults", t20)
+
+
+# ── ArbitrageDetector Tests ──────────────────────────────────
+print("\n-- ArbitrageDetector Tests --")
+
+
+def t21():
+    from scripts.forecaster.regime_gate import ArbitrageDetector
+    det = ArbitrageDetector()
+    opp = det.check_model_edge_arb(
+        model_prob=0.75, market_prob=0.50,
+        yes_ask=50, no_ask=50, ticker="TEST",
+    )
+    assert opp is not None
+    assert opp.profit_pct > 0
+test(21, "ArbitrageDetector: model_edge_arb", t21)
+
+
+# ── Physics Features Tests ───────────────────────────────────
+print("\n-- Physics Features Tests --")
+
+
+def t22():
+    from gnosis.particle import PriceParticle
+    import pandas as pd
+    import numpy as np
+    np.random.seed(42)
+    n = 200
+    close = np.cumsum(np.random.randn(n) * 0.01) + 100
+    df = pd.DataFrame({
+        "close": close,
+        "volume": np.abs(np.random.randn(n)) * 1000,
+        "high": close + np.abs(np.random.randn(n)) * 0.5,
+        "low": close - np.abs(np.random.randn(n)) * 0.5,
+        "open": close + np.random.randn(n) * 0.1,
+    })
+    df["returns"] = df["close"].pct_change().fillna(0)
+    df["symbol"] = "BTCUSDT"
+
+    pp = PriceParticle()
+    result = pp.compute_features(df)
+    assert len(result) > 0
+    phys_cols = [
+        c for c in result.columns
+        if any(w in c.lower() for w in ("momentum", "energy", "entropy", "force"))
+    ]
+    assert len(phys_cols) > 0, f"No physics columns found in {list(result.columns)[:10]}"
+test(22, "PriceParticle: physics features", t22)
+
+
+# ── QuantilePredictor Tests ──────────────────────────────────
+print("\n-- QuantilePredictor Tests --")
+
+
+def t23():
+    from gnosis.predictors.quantile import QuantilePredictor
+    qp = QuantilePredictor(models_config={})
+    assert qp is not None
+    assert hasattr(qp, "predict") or hasattr(qp, "fit")
+test(23, "QuantilePredictor: instantiation", t23)
+
+
+# ── Conformal Tests ──────────────────────────────────────────
+print("\n-- Conformal Tests --")
+
+
+def t24():
+    import numpy as np
+    from gnosis.harness.conformal import cqr_delta
+    y = np.zeros(100)
+    q_lo = np.full(100, -1.0)
+    q_hi = np.full(100, 1.0)
+    sigma = np.ones(100)
+    delta = cqr_delta(y, q_lo, q_hi, sigma=sigma, normalized=True)
+    assert isinstance(delta, float)
+    delta2 = cqr_delta(y, q_lo, q_hi, normalized=False)
+    assert isinstance(delta2, float)
+test(24, "Conformal: cqr_delta", t24)
+
+
+# ── CLI Tests ────────────────────────────────────────────────
+print("\n-- CLI Tests --")
+
+
+def t25():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "unified", os.path.join(os.path.dirname(__file__), "..", "scripts", "unified.py")
+    )
+    assert spec is not None, "Cannot find scripts/unified.py"
+test(25, "CLI: scripts.unified loadable", t25)
+
+
+# ── Bridge Wiring Tests ─────────────────────────────────────
+print("\n-- Bridge Wiring Tests --")
+
+
+def t26():
+    from gnosis.bridge import run_unified
+    assert callable(run_unified)
+    import inspect
+    sig = inspect.signature(run_unified)
+    params = list(sig.parameters.keys())
+    assert "symbol" in params
+    assert "reasoning_mode" in params
+test(26, "Bridge: run_unified callable with expected params", t26)
+
+
+# ── Dotenv / Placeholder Tests ───────────────────────────────
+print("\n-- Dotenv / Placeholder Tests --")
+
+
+def t27():
+    from gnosis.reasoning.client import _is_placeholder
+    # Should be detected as placeholders
+    assert _is_placeholder("your_openai_api_key_here") is True
+    assert _is_placeholder("sk-your-new-key") is True
+    assert _is_placeholder("changeme") is True
+    assert _is_placeholder("") is True
+    assert _is_placeholder("short") is True
+    # Real keys should NOT be placeholders
+    assert _is_placeholder("sk-proj-" + "a" * 100) is False
+    assert _is_placeholder("gsk-" + "b" * 50) is False
+test(27, "Placeholder detection: filters fake keys", t27)
+
+
+def t28():
+    from gnosis.reasoning.client import _load_dotenv, _is_placeholder
+    env = _load_dotenv()
+    oai_key = env.get("OPENAI_API_KEY", "")
+    if oai_key:
+        assert not _is_placeholder(oai_key), \
+            f"dotenv loaded placeholder key: {oai_key[:20]}"
+test(28, "Dotenv: no placeholder keys loaded", t28)
+
+
+# ── Syntax Check ─────────────────────────────────────────────
+print("\n-- Syntax Check --")
+
+
+def t29():
+    import py_compile
+    import glob
+    errors = []
+    root = os.path.join(os.path.dirname(__file__), "..")
+    for f in glob.glob(os.path.join(root, "gnosis", "**", "*.py"), recursive=True):
+        try:
+            py_compile.compile(f, doraise=True)
+        except py_compile.PyCompileError as e:
+            errors.append(str(e))
+    assert not errors, f"Syntax errors: {errors}"
+test(29, "Syntax: all gnosis/*.py files compile", t29)
+
+
+# ═══════════════════════════════════════════════════════════════
+# Restore env and report
+# ═══════════════════════════════════════════════════════════════
+for k, v in saved_env.items():
+    if v is not None:
+        os.environ[k] = v
+    else:
+        os.environ.pop(k, None)
+
+print(f"\n{'=' * 60}")
+print(f"INTEGRATION TESTS: {passed} PASSED, {failed} FAILED")
+print(f"{'=' * 60}")
+if failed:
+    for num, name, status, err in results:
+        if status == "FAIL":
+            print(f"  FAILED: {num}. {name}: {err}")
+    sys.exit(1)
+else:
+    sys.exit(0)
