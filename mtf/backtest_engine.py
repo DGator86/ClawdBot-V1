@@ -55,6 +55,50 @@ def _ece_score(y_true: np.ndarray, y_prob: np.ndarray, n_bins: int = 10) -> floa
     return float(ece)
 
 
+def _compute_metrics(pred_df: pd.DataFrame) -> Dict[str, float]:
+    return {
+        "log_loss": float(log_loss(pred_df["target"], pred_df["prob_up"], labels=[0, 1])),
+        "brier": float(brier_score_loss(pred_df["target"], pred_df["prob_up"])),
+        "accuracy": float(accuracy_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
+        "precision": float(precision_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
+        "recall": float(recall_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
+        "ece": float(_ece_score(pred_df["target"].values, pred_df["prob_up"].values)),
+    }
+
+
+def _compute_per_regime(
+    pred_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+) -> Dict[str, Dict[str, float]]:
+    vol_col = feature_df.get("1h__vol_20")
+    per_regime: Dict[str, Dict[str, float]] = {}
+    if vol_col is None:
+        return per_regime
+
+    vol_threshold = np.nanmedian(vol_col.values)
+    aligned_vol = vol_col.loc[pred_df.index]
+    low_mask = aligned_vol <= vol_threshold
+    high_mask = aligned_vol > vol_threshold
+    for name, mask in {
+        "low_vol": low_mask,
+        "high_vol": high_mask,
+    }.items():
+        if mask.sum() == 0:
+            continue
+        per_regime[name] = {
+            "accuracy": float(accuracy_score(pred_df["target"][mask], pred_df["prob_up"][mask] >= 0.5)),
+            "log_loss": float(log_loss(pred_df["target"][mask], pred_df["prob_up"][mask], labels=[0, 1])),
+        }
+    return per_regime
+
+
+def compute_metrics(
+    pred_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+) -> Tuple[Dict[str, float], Dict[str, Dict[str, float]]]:
+    return _compute_metrics(pred_df), _compute_per_regime(pred_df, feature_df)
+
+
 def build_dataset(
     bars_by_tf: Dict[str, pd.DataFrame],
     target_tf: str = PRIMARY_TARGET_TF,
@@ -113,30 +157,6 @@ def walk_forward_backtest(
         }
     ).set_index("timestamp")
 
-    metrics = {
-        "log_loss": float(log_loss(pred_df["target"], pred_df["prob_up"], labels=[0, 1])),
-        "brier": float(brier_score_loss(pred_df["target"], pred_df["prob_up"])),
-        "accuracy": float(accuracy_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
-        "precision": float(precision_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
-        "recall": float(recall_score(pred_df["target"], pred_df["prob_up"] >= 0.5)),
-        "ece": float(_ece_score(pred_df["target"].values, pred_df["prob_up"].values)),
-    }
-
-    vol_col = feature_df.get("1h__vol_20")
-    per_regime = {}
-    if vol_col is not None:
-        vol_threshold = np.nanmedian(vol_col.values)
-        low_mask = vol_col.loc[pred_df.index] <= vol_threshold
-        high_mask = vol_col.loc[pred_df.index] > vol_threshold
-        for name, mask in {
-            "low_vol": low_mask,
-            "high_vol": high_mask,
-        }.items():
-            if mask.sum() == 0:
-                continue
-            per_regime[name] = {
-                "accuracy": float(accuracy_score(pred_df["target"][mask], pred_df["prob_up"][mask] >= 0.5)),
-                "log_loss": float(log_loss(pred_df["target"][mask], pred_df["prob_up"][mask], labels=[0, 1])),
-            }
+    metrics, per_regime = compute_metrics(pred_df, feature_df)
 
     return BacktestResults(metrics=metrics, predictions=pred_df, per_regime=per_regime)
