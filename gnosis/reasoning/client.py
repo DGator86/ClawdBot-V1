@@ -33,6 +33,10 @@ OPENAI_MODEL = "gpt-4o-mini"    # Cost-effective default for direct OpenAI
 
 
 _PLACEHOLDER_PREFIXES = ("your_", "replace", "REPLACE", "xxx", "changeme", "TODO")
+_PLACEHOLDER_WORDS = ("your", "replace", "test", "fake", "dummy", "example", "changeme", "todo")
+
+# Real API keys: sk-* (OpenAI ≥51 chars), gsk-* (GenSpark), etc.
+_MIN_REAL_KEY_LENGTH = 20
 
 
 def _is_placeholder(value: str) -> bool:
@@ -44,6 +48,13 @@ def _is_placeholder(value: str) -> bool:
             return True
     if value.startswith("${") and value.endswith("}"):
         return True  # Unresolved template
+    # Catch "sk-your-new-key", "sk-test-key", etc.
+    lower = value.lower()
+    if any(word in lower for word in _PLACEHOLDER_WORDS):
+        return True
+    # Real API keys are typically 20+ characters
+    if len(value) < _MIN_REAL_KEY_LENGTH:
+        return True
     return False
 
 
@@ -165,16 +176,29 @@ class LLMConfig:
         if env_key:
             config.api_key = env_key
 
-            if env_url:
-                # Explicit base URL → custom endpoint; keep user's model choice
+            # Detect key/URL mismatches:
+            # - sk-* key + GenSpark URL = misconfiguration → fix to api.openai.com
+            # - gsk-* key + OpenAI URL = misconfiguration → fix to GenSpark
+            _is_sk_key = env_key.startswith("sk-")
+            _is_genspark_url = "genspark.ai" in env_url if env_url else False
+
+            if env_url and not (_is_sk_key and _is_genspark_url):
+                # Explicit base URL that matches the key type → custom endpoint
                 config.base_url = env_url
                 config.model = config.model or OPENAI_MODEL
                 config._environment = "custom"
-            elif env_key.startswith("sk-"):
-                # OpenAI key without explicit URL → route to api.openai.com
+            elif _is_sk_key:
+                # OpenAI key (sk-*): always route to api.openai.com
+                # This covers: no URL set, OR URL was GenSpark (mismatch)
                 config.base_url = OPENAI_DIRECT_URL
                 config.model = OPENAI_MODEL
                 config._environment = "openai_direct"
+                if _is_genspark_url:
+                    import sys
+                    print(f"[LLM] WARNING: OPENAI_API_KEY (sk-*) with GenSpark BASE_URL — "
+                          f"overriding to {OPENAI_DIRECT_URL}. "
+                          f"Unset OPENAI_BASE_URL or use a gsk-* key for GenSpark.",
+                          file=sys.stderr)
             else:
                 # Non-sk key without URL → could be GenSpark token set via env
                 config.base_url = GENSPARK_PROXY_URL
