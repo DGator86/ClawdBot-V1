@@ -22,8 +22,10 @@ from gnosis.reasoning.client import (
     LLMConfig,
     GENSPARK_PROXY_URL,
     OPENAI_DIRECT_URL,
+    OPENROUTER_URL,
     GENSPARK_MODEL,
     OPENAI_MODEL,
+    OPENROUTER_MODEL,
 )
 
 

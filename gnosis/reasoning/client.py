@@ -3,15 +3,17 @@ LLM Client — Unified interface for OpenAI-compatible API calls.
 ================================================================
 Environment-aware routing:
   1. GenSpark sandbox — uses ~/.genspark_llm.yaml (gpt-5 via proxy)
-  2. VPS / direct OpenAI — uses OPENAI_API_KEY env var (gpt-4o)
-  3. Custom endpoint — uses OPENAI_API_KEY + OPENAI_BASE_URL env vars
-  4. Offline / no key — falls back to deterministic StubLLM
+  2. OpenRouter — OPENAI_API_KEY starts with sk-or-* (free tier available)
+  3. VPS / direct OpenAI — uses OPENAI_API_KEY env var (gpt-4o-mini)
+  4. Custom endpoint — uses OPENAI_API_KEY + OPENAI_BASE_URL env vars
+  5. Offline / no key — falls back to deterministic StubLLM
 
 Detection order:
   a) ~/.genspark_llm.yaml with a RESOLVED api_key → GenSpark proxy
-  b) OPENAI_API_KEY env var (or .env file) + OPENAI_BASE_URL → custom
-  c) OPENAI_API_KEY env var (sk-*) without BASE_URL → direct OpenAI
-  d) No key anywhere → stub mode
+  b) OPENAI_API_KEY with sk-or-* prefix → OpenRouter (free models)
+  c) OPENAI_API_KEY + OPENAI_BASE_URL → custom endpoint
+  d) OPENAI_API_KEY (sk-*) without BASE_URL → direct OpenAI
+  e) No key anywhere → stub mode
 """
 from __future__ import annotations
 
@@ -26,10 +28,12 @@ from urllib import request, error
 # ── Constants ──────────────────────────────────────────────────
 GENSPARK_PROXY_URL = "https://www.genspark.ai/api/llm_proxy/v1"
 OPENAI_DIRECT_URL = "https://api.openai.com/v1"
+OPENROUTER_URL = "https://openrouter.ai/api/v1"
 
 # Models per environment
 GENSPARK_MODEL = "gpt-5"        # GenSpark proxy supports gpt-5 family
 OPENAI_MODEL = "gpt-4o-mini"    # Cost-effective default for direct OpenAI
+OPENROUTER_MODEL = "meta-llama/llama-3.3-70b-instruct:free"  # Best free model
 
 
 _PLACEHOLDER_PREFIXES = ("your_", "replace", "REPLACE", "xxx", "changeme", "TODO")
@@ -165,6 +169,7 @@ class LLMConfig:
         # ── Try environment variables ──────────────────────────
         env_key = os.environ.get("OPENAI_API_KEY", "")
         env_url = os.environ.get("OPENAI_BASE_URL", "")
+        env_model = os.environ.get("OPENAI_MODEL", "")
 
         # ── Try .env file fallback ─────────────────────────────
         if not env_key:
@@ -172,26 +177,38 @@ class LLMConfig:
             env_key = dotenv.get("OPENAI_API_KEY", "")
             if not env_url:
                 env_url = dotenv.get("OPENAI_BASE_URL", "")
+            if not env_model:
+                env_model = dotenv.get("OPENAI_MODEL", "")
 
         if env_key:
             config.api_key = env_key
 
-            # Detect key/URL mismatches:
+            # ── OpenRouter auto-detection ──────────────────────
+            # sk-or-* keys are OpenRouter tokens
+            _is_openrouter_key = env_key.startswith("sk-or-")
+            _is_openrouter_url = "openrouter.ai" in env_url if env_url else False
+
+            if _is_openrouter_key or _is_openrouter_url:
+                config.base_url = env_url if _is_openrouter_url else OPENROUTER_URL
+                config.model = env_model or OPENROUTER_MODEL
+                config._environment = "openrouter"
+                return config
+
+            # ── Detect key/URL mismatches ──────────────────────
             # - sk-* key + GenSpark URL = misconfiguration → fix to api.openai.com
-            # - gsk-* key + OpenAI URL = misconfiguration → fix to GenSpark
             _is_sk_key = env_key.startswith("sk-")
             _is_genspark_url = "genspark.ai" in env_url if env_url else False
 
             if env_url and not (_is_sk_key and _is_genspark_url):
                 # Explicit base URL that matches the key type → custom endpoint
                 config.base_url = env_url
-                config.model = config.model or OPENAI_MODEL
+                config.model = env_model or config.model or OPENAI_MODEL
                 config._environment = "custom"
             elif _is_sk_key:
                 # OpenAI key (sk-*): always route to api.openai.com
                 # This covers: no URL set, OR URL was GenSpark (mismatch)
                 config.base_url = OPENAI_DIRECT_URL
-                config.model = OPENAI_MODEL
+                config.model = env_model or OPENAI_MODEL
                 config._environment = "openai_direct"
                 if _is_genspark_url:
                     import sys
@@ -202,7 +219,7 @@ class LLMConfig:
             else:
                 # Non-sk key without URL → could be GenSpark token set via env
                 config.base_url = GENSPARK_PROXY_URL
-                config.model = GENSPARK_MODEL
+                config.model = env_model or GENSPARK_MODEL
                 config._environment = "genspark_env"
 
             return config

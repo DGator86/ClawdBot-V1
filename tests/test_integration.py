@@ -451,11 +451,122 @@ def t28():
 test(28, "Dotenv: no placeholder keys loaded", t28)
 
 
+# ── OpenRouter Routing Tests ─────────────────────────────────
+print("\n-- OpenRouter Routing Tests --")
+
+
+def t29():
+    from gnosis.reasoning.client import LLMConfig, OPENROUTER_URL, OPENROUTER_MODEL
+    os.environ["OPENAI_API_KEY"] = "sk-or-v1-" + "d" * 60
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "openrouter", f"got {cfg._environment}"
+        assert "openrouter.ai" in cfg.base_url, f"got url {cfg.base_url}"
+        assert cfg.model == OPENROUTER_MODEL, f"got model {cfg.model}"
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+test(29, "LLM Config: sk-or-v1-* -> openrouter", t29)
+
+
+def t30():
+    from gnosis.reasoning.client import LLMConfig
+    os.environ["OPENAI_API_KEY"] = "sk-or-v1-" + "e" * 60
+    os.environ["OPENAI_MODEL"] = "google/gemma-3-27b-it:free"
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "openrouter"
+        assert cfg.model == "google/gemma-3-27b-it:free", f"got {cfg.model}"
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("OPENAI_MODEL", None)
+test(30, "LLM Config: OpenRouter + custom model override", t30)
+
+
+def t31():
+    from gnosis.reasoning.client import LLMConfig
+    os.environ["OPENAI_API_KEY"] = "sk-or-v1-" + "f" * 60
+    os.environ["OPENAI_BASE_URL"] = "https://openrouter.ai/api/v1"
+    try:
+        cfg = LLMConfig.from_yaml()
+        assert cfg._environment == "openrouter"
+        assert cfg.base_url == "https://openrouter.ai/api/v1"
+    finally:
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ.pop("OPENAI_BASE_URL", None)
+test(31, "LLM Config: OpenRouter key + explicit URL", t31)
+
+
+# ── Kalshi Module Tests ──────────────────────────────────────
+print("\n-- Kalshi Module Tests --")
+
+
+def t32():
+    from gnosis.kalshi.scanner import ScanResult
+    sr = ScanResult(
+        ticker="KXBTC-26FEB08-T70000",
+        series="KXBTC",
+        side="yes",
+        strike=70000.0,
+        market_prob=0.45,
+        model_prob=0.55,
+        edge_pct=10.0,
+        cost_cents=45,
+        ev_cents=5.5,
+        composite_score=8.5,
+    )
+    d = sr.to_dict()
+    assert d["ticker"] == "KXBTC-26FEB08-T70000"
+    assert d["edge_pct"] == 10.0
+    line = sr.summary_line()
+    assert "KXBTC" in line
+    assert "10.0%" in line
+test(32, "Kalshi: ScanResult serialization + summary", t32)
+
+
+def t33():
+    from gnosis.kalshi.analyzer import ValuePlay, KalshiAnalyzer
+    from gnosis.kalshi.scanner import ScanResult
+    sr = ScanResult(
+        ticker="TEST-T100", series="TEST", side="yes",
+        market_prob=0.5, model_prob=0.6, edge_pct=10.0,
+        cost_cents=50, ev_cents=5.0, volume=50,
+        composite_score=5.0, model_source="price-distance",
+    )
+    analyzer = KalshiAnalyzer()
+    # Will use rule-based fallback (stub mode)
+    play = analyzer.analyze_single(sr)
+    assert isinstance(play, ValuePlay)
+    assert play.recommendation in ("BUY", "SKIP", "WATCH")
+    assert play.value_score >= 0
+test(33, "Kalshi: Analyzer rule-based fallback", t33)
+
+
+def t34():
+    from gnosis.kalshi.pipeline import KalshiPipeline, PipelineResult
+    pipeline = KalshiPipeline(series=["KXBTC"])
+    assert pipeline.series == ["KXBTC"]
+    assert pipeline.top_n == 5
+    result = PipelineResult()
+    assert result.buy_plays == []
+    d = result.to_dict()
+    assert "scan_count" in d
+    assert "buy_plays" in d
+test(34, "Kalshi: Pipeline + PipelineResult structure", t34)
+
+
+def t35():
+    from gnosis.kalshi import KalshiScanner, KalshiAnalyzer, KalshiPipeline
+    assert KalshiScanner is not None
+    assert KalshiAnalyzer is not None
+    assert KalshiPipeline is not None
+test(35, "Kalshi: module exports", t35)
+
+
 # ── Syntax Check ─────────────────────────────────────────────
 print("\n-- Syntax Check --")
 
 
-def t29():
+def t36():
     import py_compile
     import glob
     errors = []
@@ -466,7 +577,7 @@ def t29():
         except py_compile.PyCompileError as e:
             errors.append(str(e))
     assert not errors, f"Syntax errors: {errors}"
-test(29, "Syntax: all gnosis/*.py files compile", t29)
+test(36, "Syntax: all gnosis/*.py files compile", t36)
 
 
 # ═══════════════════════════════════════════════════════════════
