@@ -1,6 +1,6 @@
 #!/bin/bash
 # ════════════════════════════════════════════════════════════
-# VPS Deploy Script — ClawdBot + Kalshi Pipeline
+# VPS Deploy Script — ClawdBot + Kalshi + Telegram
 # ════════════════════════════════════════════════════════════
 # Single script to deploy and configure everything on the VPS.
 # Run: bash scripts/vps-deploy.sh
@@ -8,9 +8,10 @@
 # What it does:
 #   1. Pulls latest code from genspark_ai_developer
 #   2. Configures .env with OpenRouter + Kalshi keys
-#   3. Validates API connectivity
-#   4. Runs integration tests
-#   5. Starts Kalshi pipeline
+#   3. Configures Telegram bot (@KalshiYoshiBot)
+#   4. Validates API connectivity
+#   5. Runs integration tests
+#   6. Shows startup commands
 # ════════════════════════════════════════════════════════════
 
 set -euo pipefail
@@ -58,6 +59,18 @@ unset OPENAI_BASE_URL 2>/dev/null || true
 
 echo "  ✓ OpenRouter key configured"
 
+# Add Telegram bot token if not already present
+if ! grep -q '^TELEGRAM_BOT_TOKEN=' "${ENV_FILE}" 2>/dev/null; then
+    cat >> "${ENV_FILE}" << 'TGBLOCK'
+
+# ── Telegram Bot (@KalshiYoshiBot) ──
+TELEGRAM_BOT_TOKEN=8501633363:AAHj9PSpgTG9Adl6f5hGnl-IlS3184rii7E
+TGBLOCK
+    echo "  ✓ Telegram bot token added"
+else
+    echo "  ✓ Telegram bot token already configured"
+fi
+
 # Check Kalshi credentials
 if [ -n "${EXISTING_KALSHI_KEY_ID}" ] && [ "${EXISTING_KALSHI_KEY_ID}" != "your_kalshi_key_id_here" ]; then
     echo "  ✓ Kalshi key ID found: ${EXISTING_KALSHI_KEY_ID:0:12}..."
@@ -79,7 +92,7 @@ else
 fi
 
 # ── Step 3: Validate API connectivity ─────────────────────
-echo -e "\n[3/5] Testing API connectivity..."
+echo -e "\n[3/6] Testing API connectivity..."
 
 # Test OpenRouter
 python3 -c "
@@ -119,28 +132,50 @@ cfg = LLMConfig.from_yaml()
 print(f'  ✓ LLM routing: env={cfg._environment}, model={cfg.model}')
 " 2>&1 || echo "  ✗ LLM routing: FAILED"
 
+# Test Telegram bot
+python3 -c "
+import json
+from urllib import request as urlreq
+url = 'https://api.telegram.org/bot8501633363:AAHj9PSpgTG9Adl6f5hGnl-IlS3184rii7E/getMe'
+with urlreq.urlopen(url, timeout=10) as resp:
+    data = json.loads(resp.read().decode())
+    if data.get('ok'):
+        bot = data['result']
+        print(f'  ✓ Telegram: @{bot.get(\"username\", \"?\")} (id={bot.get(\"id\", \"?\")})') 
+    else:
+        print('  ✗ Telegram: invalid token')
+" 2>&1 || echo "  ✗ Telegram: FAILED"
+
 # ── Step 4: Integration tests ─────────────────────────────
-echo -e "\n[4/5] Running integration tests..."
+echo -e "\n[4/6] Running integration tests..."
 cd "${REPO_DIR}"
 python3 tests/test_integration.py 2>&1 | tail -5
 
-# ── Step 5: Ready ─────────────────────────────────────────
-echo -e "\n[5/5] Deploy complete!"
+# ── Step 5: Kill old processes ────────────────────────────
+echo -e "\n[5/6] Stopping old processes..."
+pkill -f 'telegram-bot.py' 2>/dev/null && echo "  ✓ Old Telegram bot stopped" || echo "  - No old Telegram bot running"
+pkill -f 'kalshi-system.py' 2>/dev/null && echo "  ✓ Old Kalshi system stopped" || echo "  - No old Kalshi system running"
+
+# ── Step 6: Ready ─────────────────────────────────────────
+echo -e "\n[6/6] Deploy complete!"
 echo ""
 echo "════════════════════════════════════════════"
 echo "  READY — Run these commands:"
 echo "════════════════════════════════════════════"
 echo ""
-echo "  # Quick scan (single run):"
+echo "  # ★ TELEGRAM BOT (recommended — alerts + commands):"
+echo "  nohup python3 scripts/telegram-bot.py --interval 60 > /tmp/yoshi-bot.log 2>&1 &"
+echo ""
+echo "  # View bot logs:"
+echo "  tail -f /tmp/yoshi-bot.log"
+echo ""
+echo "  # Telegram bot (no Kalshi, forecast only):"
+echo "  python3 scripts/telegram-bot.py --no-kalshi --interval 120"
+echo ""
+echo "  # Quick scan (single run, no Telegram):"
 echo "  python3 scripts/kalshi-pipeline.py"
 echo ""
-echo "  # Continuous scanning (every 2 min):"
-echo "  python3 scripts/kalshi-pipeline.py --loop --interval 120"
-echo ""
-echo "  # Legacy crypto forecast:"
-echo "  python3 -m scripts.unified -s BTCUSDT -H 24 --reasoning auto"
-echo ""
-echo "  # Kalshi edge scanner (legacy):"
-echo "  python3 scripts/kalshi-edge-scanner.py --loop --interval 120"
+echo "  # Full system (no Telegram):"
+echo "  python3 scripts/kalshi-system.py"
 echo ""
 echo "════════════════════════════════════════════"
