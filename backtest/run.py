@@ -11,47 +11,7 @@ import pandas as pd
 from mtf.backtest_engine import BacktestConfig, build_dataset, compute_metrics, walk_forward_backtest
 from mtf.constants import PRIMARY_TARGET_TF, TF_LIST, WINDOW_BARS
 from mtf.data_provider import get_multi_timeframe_candles
-
-
-def _parse_iso_timestamp(value: str) -> pd.Timestamp:
-    ts = pd.to_datetime(value, utc=True)
-    if ts.tzinfo is None:
-        ts = ts.tz_localize(timezone.utc)
-    return ts
-
-
-def _parse_ranges(ranges_arg: Optional[str]) -> Optional[List[Tuple[pd.Timestamp, pd.Timestamp]]]:
-    if not ranges_arg:
-        return None
-    ranges: List[Tuple[pd.Timestamp, pd.Timestamp]] = []
-    raw_ranges = [item.strip() for item in ranges_arg.split(",") if item.strip()]
-    for raw_range in raw_ranges:
-        if ":" not in raw_range:
-            raise ValueError(f"Invalid range '{raw_range}'. Expected start:end format.")
-        start_str, end_str = [part.strip() for part in raw_range.split(":", 1)]
-        if not start_str or not end_str:
-            raise ValueError(f"Invalid range '{raw_range}'. Expected start:end format.")
-        start_ts = _parse_iso_timestamp(start_str)
-        end_ts = _parse_iso_timestamp(end_str)
-        if start_ts >= end_ts:
-            raise ValueError(f"Invalid range '{raw_range}'. Start must be before end.")
-        ranges.append((start_ts, end_ts))
-    return ranges
-
-
-def _filter_by_range(
-    bars_by_tf: Dict[str, pd.DataFrame],
-    start_ts: pd.Timestamp,
-    end_ts: pd.Timestamp,
-) -> Dict[str, pd.DataFrame]:
-    filtered: Dict[str, pd.DataFrame] = {}
-    for tf, df in bars_by_tf.items():
-        if df.empty:
-            filtered[tf] = df
-            continue
-        mask = (df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)
-        filtered[tf] = df.loc[mask].reset_index(drop=True)
-    return filtered
+from mtf.date_ranges import filter_by_range, parse_ranges
 
 
 def _run_for_symbol(
@@ -75,7 +35,7 @@ def _run_for_symbol(
     range_payloads = []
     combined_predictions: List[pd.DataFrame] = []
     for idx, (start_ts, end_ts) in enumerate(ranges, start=1):
-        ranged_bars = _filter_by_range(bars_by_tf, start_ts, end_ts)
+        ranged_bars = filter_by_range(bars_by_tf, start_ts, end_ts)
         feature_df, label_series = build_dataset(ranged_bars, target_tf=config.target_tf)
         if feature_df.empty or len(feature_df) <= config.train_window:
             range_payloads.append(
@@ -143,7 +103,7 @@ def main() -> None:
     output_dir = args.output_dir or os.path.join("data", "backtests", run_id)
     os.makedirs(output_dir, exist_ok=True)
 
-    ranges = _parse_ranges(args.ranges)
+    ranges = parse_ranges(args.ranges)
 
     config = BacktestConfig(
         target_tf=args.target_tf,
