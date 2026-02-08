@@ -59,16 +59,18 @@ unset OPENAI_BASE_URL 2>/dev/null || true
 
 echo "  ✓ OpenRouter key configured"
 
-# Add Telegram bot token if not already present
-if ! grep -q '^TELEGRAM_BOT_TOKEN=' "${ENV_FILE}" 2>/dev/null; then
-    cat >> "${ENV_FILE}" << 'TGBLOCK'
+# Set Telegram bot token (always update to latest)
+YOSHI_TOKEN="8501633363:AAFDTd4U3S_qoCKVN2Y6m0D7v_qePVuUnnI"
+if grep -q '^TELEGRAM_BOT_TOKEN=' "${ENV_FILE}" 2>/dev/null; then
+    sed -i "s|^TELEGRAM_BOT_TOKEN=.*|TELEGRAM_BOT_TOKEN=${YOSHI_TOKEN}|" "${ENV_FILE}"
+    echo "  ✓ Telegram bot token updated"
+else
+    cat >> "${ENV_FILE}" << TGBLOCK
 
 # ── Telegram Bot (@KalshiYoshiBot) ──
-TELEGRAM_BOT_TOKEN=8501633363:AAFDTd4U3S_qoCKVN2Y6m0D7v_qePVuUnnI
+TELEGRAM_BOT_TOKEN=${YOSHI_TOKEN}
 TGBLOCK
     echo "  ✓ Telegram bot token added"
-else
-    echo "  ✓ Telegram bot token already configured"
 fi
 
 # Check Kalshi credentials
