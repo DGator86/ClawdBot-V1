@@ -18,12 +18,12 @@ Standalone — no Yoshi-Bot dependency. Requires: cryptography (pip3 install cry
 """
 
 import argparse
-import base64
 import json
+import logging
 import os
 import sys
-import time
-from urllib import request, parse as urlparse
+
+from kalshi_client import KalshiClient
 
 
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
@@ -81,6 +81,11 @@ def load_env():
                                 os.environ[key] = val
                             else:
                                 os.environ.setdefault(key, val)
+            except Exception as e:
+                # Don't swallow env-loading errors silently
+                logging.warning(f"Failed to load .env from {env_path}: {e}")
+                import traceback
+                logging.debug(traceback.format_exc())
             except Exception:
                 pass
 
@@ -208,16 +213,16 @@ def main():
         sys.exit(1)
 
     if args.positions:
-        result = client._request("GET", "/portfolio/positions?limit=100")
+        result = client.get_positions(limit=100)
         print(json.dumps(result, indent=2))
     elif args.orders:
-        result = client._request("GET", "/portfolio/orders?status=resting")
+        result = client.list_orders(status="resting")
         print(json.dumps(result, indent=2))
     elif args.balance:
-        result = client._request("GET", "/portfolio/balance")
+        result = client.get_balance()
         print(json.dumps(result, indent=2))
     elif args.cancel:
-        result = client._request("DELETE", f"/portfolio/orders/{args.cancel}")
+        result = client.cancel_order(args.cancel)
         print(json.dumps(result, indent=2))
     elif args.ticker and args.side:
         print(f"Placing order: {args.count}x {args.side.upper()} on {args.ticker} ({args.type})")
@@ -226,7 +231,7 @@ def main():
         print(json.dumps(result, indent=2))
         if isinstance(result, dict) and "order" in result:
             order = result["order"]
-            print(f"\n Order placed!")
+            print("\n Order placed!")
             print(f"   Order ID: {order.get('order_id')}")
             print(f"   Status:   {order.get('status')}")
         elif isinstance(result, dict) and ("error" in result or "code" in result):

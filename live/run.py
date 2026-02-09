@@ -4,14 +4,14 @@ import argparse
 import os
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Dict
+from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
 from mtf.backtest_engine import build_dataset
 from mtf.constants import TF_LIST, WINDOW_BARS
 from mtf.data_provider import get_latest_closed_bar, get_multi_timeframe_candles
+from mtf.date_ranges import filter_by_ranges_union, parse_ranges
 from mtf.feature_engine import assemble_feature_row, build_feature_frames
 from mtf.models import EnsembleModel
 from mtf.utils import is_timeframe_boundary, utc_now
@@ -25,6 +25,7 @@ class LiveConfig:
     train_window: int = 1000
     refit_every: int = 10
     heartbeat_seconds: int = 1
+    ranges: Optional[List[Tuple[pd.Timestamp, pd.Timestamp]]] = None
 
 
 class LivePredictor:
@@ -38,6 +39,13 @@ class LivePredictor:
     def initialize(self) -> None:
         for symbol in self.config.symbols:
             bars = get_multi_timeframe_candles(symbol, limit=self.config.window)
+            if self.config.ranges:
+                bars = filter_by_ranges_union(bars, self.config.ranges)
+                if any(df.empty for df in bars.values()):
+                    raise ValueError(
+                        f"Filtered history for {symbol} has empty timeframe data. "
+                        "Check --ranges for coverage."
+                    )
             self.bars_by_tf[symbol] = bars
             feature_frames = build_feature_frames(bars)
             self.feature_frames[symbol] = feature_frames
@@ -118,9 +126,16 @@ def main() -> None:
     parser.add_argument("--train_window", type=int, default=1000)
     parser.add_argument("--refit_every", type=int, default=10)
     parser.add_argument("--heartbeat_seconds", type=int, default=1)
+    parser.add_argument(
+        "--ranges",
+        type=str,
+        default=None,
+        help="Comma-separated date ranges: start:end (UTC/ISO-8601).",
+    )
     args = parser.parse_args()
 
     symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
+    ranges = parse_ranges(args.ranges)
 
     config = LiveConfig(
         symbols=symbols,
@@ -129,6 +144,7 @@ def main() -> None:
         train_window=args.train_window,
         refit_every=args.refit_every,
         heartbeat_seconds=args.heartbeat_seconds,
+        ranges=ranges,
     )
 
     LivePredictor(config).run()

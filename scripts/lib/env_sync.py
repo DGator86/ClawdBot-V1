@@ -24,7 +24,9 @@ from typing import Optional
 from urllib import request, error
 
 # All known .env file locations
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 ENV_FILES = [
+    os.path.join(_PROJECT_ROOT, ".env"),
     "/root/ClawdBot-V1/.env",
     "/root/Yoshi-Bot/.env",
     "/root/.env",
