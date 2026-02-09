@@ -23,6 +23,10 @@ ExecStartPre=/usr/bin/python3 /root/ClawdBot-V1/scripts/rebuild-config.py --quie
 # Uses reduced bars/forecasts for quick boot (full diagnostics via cron)
 ExecStartPre=-/usr/bin/python3 -m scripts.forecaster.diagnose --bars 500 --forecasts 20 --auto-fix --output /root/ClawdBot-V1/data/diagnostics_report.json
 
+# Kill port again right before start (ExecStartPre scripts take 15s+)
+ExecStartPre=-/usr/bin/fuser -k -9 18789/tcp
+ExecStartPre=/bin/sleep 1
+
 # Start moltbot gateway
 ExecStart=/usr/bin/moltbot gateway --port 18789
 
