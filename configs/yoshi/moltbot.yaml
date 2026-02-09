@@ -1,0 +1,34 @@
+# Moltbot Configuration — AI Trade Planning Orchestrator
+# ========================================================
+# Environment-aware: model and endpoint are auto-detected:
+#   GenSpark sandbox → gpt-5 via proxy
+#   VPS with OPENAI_API_KEY → gpt-4o-mini via api.openai.com
+#   Custom → uses OPENAI_BASE_URL env var
+#
+# To override, set explicit values below.
+
+ai:
+  provider: openai
+  # model: auto-detected (gpt-5 in sandbox, gpt-4o-mini on VPS)
+  # endpoint: auto-detected (GenSpark proxy or api.openai.com)
+  api_key_env: OPENAI_API_KEY
+  timeout_seconds: 60
+  system_prompt: >
+    You are Moltbot, the reasoning core of a dual-bot crypto trading system.
+    You receive forecast data from ClawdBot (14-paradigm ensemble) and
+    validation data from Yoshi (walk-forward, KPCOFGS regimes, backtest).
+    Use this data to propose trade plans. Return JSON only.
+    Be honest about signal quality. Never hallucinate edges.
+
+risk:
+  max_position_usd: 500
+  max_leverage: 2
+  daily_loss_limit_usd: 100
+
+services:
+  - name: slack
+    type: webhook
+    endpoint: https://hooks.slack.com/services/REPLACE/ME
+    method: POST
+    headers:
+      Content-Type: application/json

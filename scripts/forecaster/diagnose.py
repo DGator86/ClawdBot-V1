@@ -1,6 +1,5 @@
 """
 Forecaster Diagnostic Suite (Ultimate Enhanced)
-==================================================
 Honest assessment of model quality with auto-fix integration.
 
 Diagnostics:
@@ -22,6 +21,17 @@ Ultimate-fix enhancements:
 Run:
     python3 -m scripts.forecaster.diagnose --bars 2000 --forecasts 75
     python3 -m scripts.forecaster.diagnose --bars 2000 --auto-fix
+Forecaster Diagnostic Suite
+Honest assessment of model quality. Answers:
+
+1. Is direction HR statistically better than coin flip?
+2. Is the GBM helping or hurting vs the baseline?
+3. Where does the model work (regime/vol) and where does it fail?
+4. Is the model calibrated or just hedging with wide intervals?
+5. Are the features stable or is importance just noise?
+
+Run:
+    python3 -m scripts.forecaster.diagnose --bars 2000 --forecasts 75
 """
 from __future__ import annotations
 import math
@@ -250,6 +260,11 @@ def run_diagnosis(n_bars: int = 2000,
         enable_mc=True, enable_hybrid_ml=False,
         enable_regime_gate=False, enable_auto_fix=False,
     )
+    # ── Run A: BASELINE (no GBM — fresh forecaster) ───────
+    if verbose:
+        print(f"\n--- TEST A: Baseline (weighted average, no GBM) ---")
+
+    fc_base = Forecaster(enable_mc=True)
     ev_base = WalkForwardEvaluator(
         forecaster=fc_base, bars=bars,
         horizon_hours=24, min_history=168, step_size=24,
@@ -273,6 +288,14 @@ def run_diagnosis(n_bars: int = 2000,
         enable_mc=True, enable_hybrid_ml=True,
         enable_regime_gate=True, enable_auto_fix=True,
     )
+    # ── Run B: WITH GBM ───────────────────────────────────
+    # The GBM trains walk-forward during the evaluation, so
+    # early forecasts use baseline, later ones use GBM.
+    # This IS the real comparison — same data, same order.
+    if verbose:
+        print(f"\n--- TEST B: With GBM meta-learner ---")
+
+    fc_gbm = Forecaster(enable_mc=True)
     ev_gbm = WalkForwardEvaluator(
         forecaster=fc_gbm, bars=bars,
         horizon_hours=24, min_history=168, step_size=24,
@@ -295,6 +318,7 @@ def run_diagnosis(n_bars: int = 2000,
 
     if verbose:
         print(f"  Hybrid ML: HR={metrics_gbm.hit_rate:.1%}, "
+        print(f"  GBM: HR={metrics_gbm.hit_rate:.1%}, "
               f"MCC={metrics_gbm.mcc:.4f}, "
               f"trained={gbm_trained}, samples={gbm_samples}")
         delta = metrics_gbm.hit_rate - metrics_base.hit_rate
@@ -337,6 +361,7 @@ def run_diagnosis(n_bars: int = 2000,
             print(f"    ALERT:    {alert}")
 
     # Use enhanced records for remaining diagnostics
+    # Use GBM records for remaining diagnostics
     records = records_gbm
 
     # ── Statistical test: is HR different from coin flip? ──
@@ -493,6 +518,7 @@ def run_diagnosis(n_bars: int = 2000,
         print(f"  Status: {auto_fix_report.verdict}")
         for action in auto_fix_report.actions_taken:
             print(f"  ACTION: {action}")
+            print(f"  GBM not trained (insufficient samples)")
 
     # ── VERDICT ───────────────────────────────────────────
     report.elapsed_s = time.time() - t0
@@ -704,6 +730,7 @@ def full_diagnostics_and_fix(
 def main():
     parser = argparse.ArgumentParser(
         description="Forecaster Diagnostic Suite (Ultimate Enhanced)")
+        description="Forecaster Diagnostic Suite (14-Paradigm)")
     parser.add_argument("--bars", type=int, default=2000)
     parser.add_argument("--forecasts", type=int, default=75)
     parser.add_argument("--json", action="store_true")

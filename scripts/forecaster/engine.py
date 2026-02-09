@@ -1,7 +1,8 @@
 """
 Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced)
-================================================================
 Wires all 12 modules through the regime gate, produces a unified
+Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced + Particle)
+Wires all 14 modules through the regime gate, produces a unified
 ForecastResult, and exposes a simple `forecast()` API.
 
 Ultimate-fix enhancements:
@@ -16,6 +17,18 @@ Architecture:
                                   -> HybridPredictor -> RegimeGate
                                   -> MonteCarloModule -> AutoFix
                                   -> ForecastResult
+Particle candle enhancements:
+  - Event-quantized bars: aggregate by volume/trades/entropy (not clock time)
+  - Simplex geometry: B + W_u + W_l = 1 on the candle manifold
+  - Manifold patterns: GMM clustering + classical pattern template matching
+  - Forward distributions: conditional P(Δp | pattern, regime) per cluster
+
+Architecture:
+  MarketSnapshot -> [9 Base Modules] -> RegimeDetector -> GatingPolicy
+                 -> ParticleCandleModule -> ManifoldPatternModule
+                 -> HybridPredictor -> RegimeGate
+                 -> MonteCarloModule -> AutoFix
+                 -> ForecastResult
 
 Usage:
     from scripts.forecaster.engine import Forecaster
@@ -57,6 +70,10 @@ from .modules import (
 from .ml_models import HybridPredictor, TemporalFeatureExtractor
 from .regime_gate import RegimeGate, ArbitrageDetector, should_trade, GateDecision
 from .auto_fix import AutoFixPipeline, CalibrationSuite
+
+# Particle candle + manifold pattern imports
+from .particle_candles import ParticleCandleModule, ParticleCandleBuilder, EventBar, EventBarSequence
+from .manifold_patterns import ManifoldPatternModule, ManifoldPatternDetector, PatternDetection
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -196,7 +213,11 @@ class ForecastResult:
 
 class Forecaster:
     """
-    12-paradigm ensemble forecaster with regime gating.
+    14-paradigm ensemble forecaster with regime gating.
+
+    Paradigms 1-12: original ensemble (technical, classical, macro, etc.)
+    Paradigm 13: Particle candle analysis (event-quantized bars + simplex geometry)
+    Paradigm 14: Manifold pattern detection (motif clustering + classical mapping)
 
     Usage:
         fc = Forecaster()
@@ -215,6 +236,9 @@ class Forecaster:
                  enable_regime_gate: bool = True,
                  enable_hybrid_ml: bool = True,
                  enable_auto_fix: bool = True):
+                 enable_auto_fix: bool = True,
+                 enable_particle_candles: bool = True,
+                 enable_manifold_patterns: bool = True):
         # ── Instantiate all modules ───────────────────────
         self.technical = TechnicalModule()
         self.classical = ClassicalStatsModule()
@@ -238,6 +262,14 @@ class Forecaster:
         self.arb_detector = ArbitrageDetector()
         self._temporal_extractor = TemporalFeatureExtractor(lookback=48)
 
+        # ── Particle candle + manifold pattern modules ────
+        self.particle_candle = ParticleCandleModule(
+            rule="adaptive", window_sizes=(20, 40),
+        )
+        self.manifold_pattern = ManifoldPatternModule(
+            window=30, candle_rule="adaptive",
+        )
+
         # Config
         self.mc_iterations = mc_iterations
         self.mc_steps = mc_steps
@@ -246,6 +278,8 @@ class Forecaster:
         self.enable_regime_gate = enable_regime_gate
         self.enable_hybrid_ml = enable_hybrid_ml
         self.enable_auto_fix = enable_auto_fix
+        self.enable_particle_candles = enable_particle_candles
+        self.enable_manifold_patterns = enable_manifold_patterns
 
         # All predictive modules (order matters for feature flow)
         self._modules = [
@@ -319,6 +353,17 @@ class Forecaster:
 
         # ── Step 3: Compute and apply gating weights ──────
         gating_weights = self.regime_detector.compute_weights(regime_probs)
+
+        # Zero-out weights for modules with no actual data input.
+        # If a module reports very low confidence (≤ 0.15) it means
+        # it had no real data to work with (e.g. derivatives: 0/2,
+        # macro: 0 items, onchain: empty).  Giving these weight just
+        # pollutes the ensemble with priors that look like signal.
+        _NO_DATA_THRESHOLD = 0.15
+        for out in module_outputs:
+            if out.confidence <= _NO_DATA_THRESHOLD:
+                gating_weights[out.module_name] = 0.0
+
         result.gating_weights = {
             k: round(v, 4) for k, v in gating_weights.items()
         }
@@ -350,6 +395,41 @@ class Forecaster:
         # Assign regime info to ensemble targets
         ensemble_targets.regime = dominant
         ensemble_targets.regime_probs = regime_probs
+
+        # ── Step 4a2: Particle candle module ────────────────
+        if self.enable_particle_candles and len(snap.bars_1h) >= 20:
+            try:
+                pc_out = self.particle_candle.predict(snap, horizon_hours)
+                if pc_out.confidence > 0:
+                    module_outputs.append(pc_out)
+                    result.module_outputs[pc_out.module_name] = {
+                        "confidence": round(pc_out.confidence, 4),
+                        "direction_prob": round(pc_out.targets.direction_prob, 4),
+                        "expected_return": round(pc_out.targets.expected_return, 6),
+                        "volatility": round(pc_out.targets.volatility_forecast, 6),
+                        "n_event_bars": pc_out.metadata.get("n_event_bars", 0),
+                        "elapsed_ms": round(pc_out.elapsed_ms, 2),
+                    }
+            except Exception as e:
+                result.module_outputs["particle_candle"] = {"error": str(e)}
+
+        # ── Step 4a3: Manifold pattern module ──────────────
+        if self.enable_manifold_patterns and len(snap.bars_1h) >= 20:
+            try:
+                mp_out = self.manifold_pattern.predict(snap, horizon_hours)
+                if mp_out.confidence > 0:
+                    module_outputs.append(mp_out)
+                    result.module_outputs[mp_out.module_name] = {
+                        "confidence": round(mp_out.confidence, 4),
+                        "direction_prob": round(mp_out.targets.direction_prob, 4),
+                        "expected_return": round(mp_out.targets.expected_return, 6),
+                        "pattern": mp_out.metadata.get("pattern", "none"),
+                        "breakout_bias": mp_out.metadata.get("breakout_bias", "neutral"),
+                        "match_score": mp_out.metadata.get("match_score", 0),
+                        "elapsed_ms": round(mp_out.elapsed_ms, 2),
+                    }
+            except Exception as e:
+                result.module_outputs["manifold_pattern"] = {"error": str(e)}
 
         # ── Step 4b: Hybrid ML enhancement ────────────────
         if self.enable_hybrid_ml and snap.closes:
@@ -395,6 +475,8 @@ class Forecaster:
                     "original_dir_prob": round(gate_decision.original_direction_prob, 4),
                     "gated_dir_prob": round(gate_decision.gated_direction_prob, 4),
                     "multiplier": round(gate_decision.confidence_multiplier, 4),
+                    "ev_edge": round(gate_decision.ev_edge, 4),
+                    "min_ev_required": round(gate_decision.min_ev_required, 4),
                 }
             except Exception as e:
                 result.module_outputs["regime_gate"] = {"error": str(e)}
@@ -475,11 +557,13 @@ class Forecaster:
             if mc_out and "mc_p5_price" in mc_out.features:
                 # Use MC-derived quantiles (more accurate with jumps)
                 result.price_q05 = round(mc_out.features["mc_p5_price"], 2)
-                result.price_q10 = round(price * math.exp(ensemble_targets.quantile_10), 2)
+                result.price_q10 = round(mc_out.features.get("mc_p10_price",
+                    mc_out.features["mc_p5_price"] * 0.5 + mc_out.features["mc_p25_price"] * 0.5), 2)
                 result.price_q25 = round(mc_out.features["mc_p25_price"], 2)
                 result.price_q50 = round(mc_out.features["mc_median_price"], 2)
                 result.price_q75 = round(mc_out.features["mc_p75_price"], 2)
-                result.price_q90 = round(price * math.exp(ensemble_targets.quantile_90), 2)
+                result.price_q90 = round(mc_out.features.get("mc_p90_price",
+                    mc_out.features["mc_p75_price"] * 0.5 + mc_out.features["mc_p95_price"] * 0.5), 2)
                 result.price_q95 = round(mc_out.features["mc_p95_price"], 2)
             else:
                 # Gaussian approximation
@@ -490,6 +574,15 @@ class Forecaster:
                 result.price_q75 = round(price * math.exp(mu + 0.674 * sigma), 2)
                 result.price_q90 = round(price * math.exp(mu + 1.28 * sigma), 2)
                 result.price_q95 = round(price * math.exp(mu + 1.645 * sigma), 2)
+
+            # Enforce monotonic quantile ordering (Q05 <= Q10 <= ... <= Q95)
+            qs = [result.price_q05, result.price_q10, result.price_q25,
+                  result.price_q50, result.price_q75, result.price_q90, result.price_q95]
+            for i in range(1, len(qs)):
+                if qs[i] < qs[i - 1]:
+                    qs[i] = qs[i - 1]
+            (result.price_q05, result.price_q10, result.price_q25,
+             result.price_q50, result.price_q75, result.price_q90, result.price_q95) = qs
 
             # Barrier probs (from MC or ensemble)
             if mc_out and mc_out.targets.barrier_strike > 0:
@@ -513,13 +606,18 @@ class Forecaster:
                  symbol: str = "BTCUSDT",
                  horizon_hours: float = 24.0,
                  barrier_strike: Optional[float] = None,
+                 bars_limit: int = 2000,
                  ) -> ForecastResult:
         """
         Auto-fetch market data and run the ensemble.
-        Requires the data module to be available.
+
+        bars_limit: Number of 1h bars to fetch.  Defaults to 2000
+        (~83 days) to match diagnostic back-test conditions.  Using
+        fewer bars (e.g. 200) gives the engine a different data
+        distribution than the one diagnostics validated against.
         """
         from .data import fetch_market_snapshot
-        snap = fetch_market_snapshot(symbol)
+        snap = fetch_market_snapshot(symbol, bars_limit=bars_limit)
         return self.forecast_from_snapshot(
             snap, horizon_hours, barrier_strike
         )
@@ -580,7 +678,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Crypto Forecaster -- 12-Paradigm Ensemble"
+        description="Crypto Forecaster -- 14-Paradigm Ensemble"
     )
     parser.add_argument("--symbol", "-s", default="BTCUSDT",
                         help="Symbol to forecast (default: BTCUSDT)")
@@ -592,6 +690,8 @@ def main():
                         help="Monte Carlo iterations (default: 50000)")
     parser.add_argument("--mc-steps", type=int, default=48,
                         help="Monte Carlo steps (default: 48)")
+    parser.add_argument("--bars", type=int, default=2000,
+                        help="Number of 1h bars to fetch (default: 2000)")
     parser.add_argument("--no-mc", action="store_true",
                         help="Disable Monte Carlo simulation")
     parser.add_argument("--json", action="store_true",
@@ -606,7 +706,7 @@ def main():
         enable_mc=not args.no_mc,
     )
 
-    print(f"Running 12-paradigm ensemble forecast for {args.symbol} "
+    print(f"Running 14-paradigm ensemble forecast for {args.symbol} "
           f"(horizon={args.horizon}h)...")
     print(f"Monte Carlo: {'ON' if not args.no_mc else 'OFF'} "
           f"({args.mc_iterations:,} iterations)")
@@ -615,6 +715,7 @@ def main():
         symbol=args.symbol,
         horizon_hours=args.horizon,
         barrier_strike=args.barrier,
+        bars_limit=args.bars,
     )
 
     if args.json:
@@ -638,11 +739,11 @@ def _print_report(r: ForecastResult):
     arrow = "\u2191" if r.direction == "Up" else "\u2193" if r.direction == "Down" else "\u2194"
 
     print(f"\n{'='*64}")
-    print(f"  12-PARADIGM ENSEMBLE FORECAST -- {r.symbol}")
+    print(f"  14-PARADIGM ENSEMBLE FORECAST -- {r.symbol}")
     print(f"{'='*64}")
     print(f"  Timestamp:        {r.timestamp}")
     print(f"  Horizon:          {r.horizon_hours}h")
-    print(f"  Modules Run:      {r.modules_run}/12")
+    print(f"  Modules Run:      {r.modules_run}/14")
     print(f"  Elapsed:          {r.elapsed_ms:.1f}ms")
     print(f"{'─'*64}")
     print(f"  Current Price:    ${r.current_price:>12,.2f}")
@@ -684,6 +785,31 @@ def _print_report(r: ForecastResult):
     for name, info in r.module_outputs.items():
         if "error" in info:
             print(f"    {name:20s} ERROR: {info['error']}")
+        elif name == "regime_gate":
+            # Gate shows action/tier, not standard module format
+            action = info.get("action", "?")
+            tier = info.get("tier", "?")
+            orig = info.get("original_dir_prob", 0.5)
+            gated = info.get("gated_dir_prob", 0.5)
+            mult = info.get("multiplier", 1.0)
+            ev = info.get("ev_edge", 0.0)
+            min_ev = info.get("min_ev_required", 0.04)
+            ev_ok = "✓" if ev >= min_ev else "✗"
+            print(f"    {name:20s} {action:>8s} tier={tier} "
+                  f"dir: {orig:.3f}→{gated:.3f} mult={mult:.2f} "
+                  f"EV={ev:.3f}{ev_ok}(min={min_ev:.3f})")
+        elif name in ("particle_candle", "manifold_pattern"):
+            # Show pattern-specific info
+            conf = info.get("confidence", 0)
+            dp = info.get("direction_prob", 0.5)
+            d_arrow = "\u2191" if dp > 0.55 else "\u2193" if dp < 0.45 else "\u2194"
+            extra = ""
+            if name == "particle_candle":
+                extra = f" bars={info.get('n_event_bars', '?')}"
+            elif name == "manifold_pattern":
+                extra = f" {info.get('pattern', '?')}({info.get('breakout_bias', '?')})"
+            print(f"    {name:20s} conf={conf:.2f} dir={dp:.3f}{d_arrow}{extra} "
+                  f"t={info.get('elapsed_ms', 0):.0f}ms")
         else:
             conf = info.get("confidence", 0)
             dp = info.get("direction_prob", 0.5)

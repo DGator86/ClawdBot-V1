@@ -1,0 +1,17 @@
+forecast_horizons:
+  - {name: "H_2k_trades", n_trades: 2000}
+  - {name: "H_20k_trades", n_trades: 20000}
+
+particle:
+  flow_weight: 1.0
+  regime_weight: 1.0
+  barrier_weight: 1.0
+
+predictor:
+  type: "quantile_linear"
+  quantiles: [0.05, 0.50, 0.95]
+  l2_reg: 1.0
+
+kpcofgs:
+  type: "rules_then_calibrated"
+  calibration: "isotonic"

@@ -94,6 +94,7 @@ def run_simulation(
         elif regime_probs.get("vol_expansion", 0) > 0.3:
             vol_adj = 1.3   # expanding vol
         sigma *= vol_adj
+    sigma = volatility
 
     # ── Generate price paths ─────────────────────────────────
     Z = rng.standard_normal((n_iterations, n_steps))
@@ -105,6 +106,7 @@ def run_simulation(
         jump_mu = -0.02 if crash_prob > jump_prob * 0.4 else 0.0
         # Jump sizes use raw vol (not scaled) to preserve tail accuracy
         jump_sigma = volatility * 2
+        jump_sigma = sigma * 2
         N_jumps = rng.poisson(jump_lambda * dt, (n_iterations, n_steps))
         J_sizes = rng.normal(jump_mu, jump_sigma, (n_iterations, n_steps))
         increments += N_jumps * J_sizes

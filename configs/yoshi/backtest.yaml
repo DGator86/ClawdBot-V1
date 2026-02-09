@@ -1,0 +1,22 @@
+backtest:
+  initial_capital: 10000.0
+  random_seed: 1337
+
+  signal:
+    mode: "x_hat_threshold"      # x_hat_threshold, quantile_skew
+    long_threshold: 0.0          # Go long when x_hat > threshold
+    use_abstain: true            # Respect abstain flag (long only when abstain==False)
+    min_confidence: 0.0          # Min S_pmax to trade
+
+  position:
+    mode: "fixed_pct"            # fixed_pct, notional_fixed
+    equity_pct: 1.0              # 100% of equity
+    notional_usd: 1000.0         # Only used if mode=notional_fixed
+    long_only: true
+
+  execution:
+    fee_bps: 7.5                 # Taker fee (Binance spot)
+    spread_bps: 2.0              # Half-spread
+    slippage_bps: 0.0            # Fixed slippage (optional)
+    slippage_model: "fixed"      # fixed, vol_proportional
+    slippage_k: 0.35             # Vol-proportional factor
