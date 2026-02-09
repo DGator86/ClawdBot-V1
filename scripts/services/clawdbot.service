@@ -24,7 +24,7 @@ ExecStartPre=/usr/bin/python3 /root/ClawdBot-V1/scripts/rebuild-config.py --quie
 ExecStartPre=-/usr/bin/python3 -m scripts.forecaster.diagnose --bars 500 --forecasts 20 --auto-fix --output /root/ClawdBot-V1/data/diagnostics_report.json
 
 # Start moltbot gateway
-ExecStart=/usr/local/bin/moltbot gateway --port 18789
+ExecStart=/usr/bin/moltbot gateway --port 18789
 
 Restart=always
 RestartSec=10
