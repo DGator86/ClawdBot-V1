@@ -1,0 +1,22 @@
+[Unit]
+Description=Kalshi Crypto Trading Bot
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/kalshi-bot
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kalshi-bot
+
+# Security
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/root/kalshi-bot
+
+[Install]
+WantedBy=multi-user.target
