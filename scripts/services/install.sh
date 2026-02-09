@@ -116,7 +116,7 @@ echo -e "${YELLOW}[1/7] Fixing PEM keys...${NC}"
 echo -e "${CYAN}=== Installing ClawdBot Services ===${NC}\n"
 
 # 1. Fix PEM keys
-echo -e "${YELLOW}[1/5] Fixing PEM keys...${NC}"
+echo -e "${YELLOW}[1/7] Fixing PEM keys...${NC}"
 python3 -c "
 import sys
 sys.path.insert(0, '$PROJECT_DIR')
@@ -172,8 +172,34 @@ echo -e "${YELLOW}[3/5] Rebuilding moltbot.json...${NC}"
 python3 "$PROJECT_DIR/scripts/rebuild-config.py" --quiet 2>/dev/null || \
     echo "  Skipped (rebuild-config.py not found)"
 
+# 3b. Install ML dependencies (ultimate-fix)
+echo -e "${YELLOW}[4/7] Installing ML dependencies...${NC}"
+if [ -f "$PROJECT_DIR/requirements-ml.txt" ]; then
+    pip3 install -r "$PROJECT_DIR/requirements-ml.txt" --quiet --break-system-packages 2>/dev/null \
+        || pip3 install -r "$PROJECT_DIR/requirements-ml.txt" --quiet 2>/dev/null \
+        || echo "  Skipped (pip install failed)"
+else
+    pip3 install numpy scipy lightgbm scikit-learn pandas pyarrow --quiet --break-system-packages 2>/dev/null \
+        || pip3 install numpy scipy lightgbm scikit-learn pandas pyarrow --quiet 2>/dev/null \
+        || echo "  Skipped"
+fi
+python3 -c "import lightgbm; import sklearn; print(f'  LightGBM {lightgbm.__version__}, scikit-learn {sklearn.__version__}')" 2>/dev/null || echo "  ML deps: some missing"
+
+# 3c. Validate forecaster modules (ultimate-fix)
+echo -e "${YELLOW}[5/7] Validating forecaster modules...${NC}"
+python3 -c "
+import sys, os
+sys.path.insert(0, '$PROJECT_DIR')
+try:
+    from scripts.forecaster.engine import Forecaster
+    fc = Forecaster()
+    print(f'  Forecaster: {len(fc._modules)} modules, hybrid_ml={fc.enable_hybrid_ml}, regime_gate={fc.enable_regime_gate}')
+except Exception as e:
+    print(f'  Warning: {e}')
+" 2>/dev/null || echo "  Skipped (import failed)"
+
 # 4. Install service files
-echo -e "${YELLOW}[4/5] Installing service files...${NC}"
+echo -e "${YELLOW}[6/7] Installing service files...${NC}"
 
 # Find moltbot binary
 MOLTBOT_BIN=$(which moltbot 2>/dev/null || echo "/usr/local/bin/moltbot")

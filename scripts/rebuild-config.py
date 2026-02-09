@@ -227,10 +227,29 @@ def build_config(env: dict,
     return config, gateway_token
 
 
+def _deep_merge(base: dict, override: dict) -> dict:
+    """
+    Recursively merge override into base.
+    Override values win for non-dict fields.
+    For dicts, recurse. For lists, override wins.
+    """
+    merged = dict(base)
+    for key, val in override.items():
+        if key in merged and isinstance(merged[key], dict) and isinstance(val, dict):
+            merged[key] = _deep_merge(merged[key], val)
+        else:
+            merged[key] = val
+    return merged
+
+
 def write_config(config: dict, paths: list[str] = None,
-                 verbose: bool = True) -> list[str]:
+                 verbose: bool = True, merge: bool = False) -> list[str]:
     """
     Write moltbot.json to all config paths.
+
+    If merge=True, reads the existing config first and deep-merges our
+    fields on top.  This preserves moltbot-managed keys (auth bindings,
+    plugin state, agent routing) that ``moltbot agents add`` writes.
 
     Returns list of paths written.
     """
@@ -240,12 +259,27 @@ def write_config(config: dict, paths: list[str] = None,
     written = []
     for cfg_path in paths:
         os.makedirs(os.path.dirname(cfg_path), exist_ok=True)
+
+        if merge and os.path.isfile(cfg_path):
+            try:
+                with open(cfg_path) as f:
+                    existing = json.load(f)
+                final = _deep_merge(existing, config)
+                if verbose:
+                    print(f"  Merged: {cfg_path}")
+            except Exception:
+                final = config
+                if verbose:
+                    print(f"  Written (merge failed, fresh): {cfg_path}")
+        else:
+            final = config
+            if verbose:
+                print(f"  Written: {cfg_path}")
+
         with open(cfg_path, "w") as f:
-            json.dump(config, f, indent=2)
+            json.dump(final, f, indent=2)
         os.chmod(cfg_path, 0o600)  # restrict permissions (contains tokens)
         written.append(cfg_path)
-        if verbose:
-            print(f"  Written: {cfg_path}")
 
     return written
 
@@ -312,6 +346,8 @@ def main():
                         help="Show config without writing")
     parser.add_argument("--verify", action="store_true",
                         help="Verify existing config files")
+    parser.add_argument("--merge", action="store_true",
+                        help="Merge with existing config (preserves moltbot agent auth/bindings)")
     parser.add_argument("--quiet", "-q", action="store_true")
     args = parser.parse_args()
 
@@ -355,7 +391,7 @@ def main():
     # Write config
     if verbose:
         print(f"\n  Writing configs...")
-    written = write_config(config, verbose=verbose)
+    written = write_config(config, verbose=verbose, merge=args.merge)
 
     # Verify
     if verbose:

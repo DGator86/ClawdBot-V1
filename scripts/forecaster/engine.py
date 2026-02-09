@@ -1,6 +1,7 @@
 """
+Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced)
+Wires all 12 modules through the regime gate, produces a unified
 Forecaster Engine -- Ensemble Orchestrator (Ultimate Enhanced + Particle)
-==========================================================================
 Wires all 14 modules through the regime gate, produces a unified
 ForecastResult, and exposes a simple `forecast()` API.
 
@@ -11,6 +12,11 @@ Ultimate-fix enhancements:
   - Health monitoring: rolling HR tracking with auto-retrain
   - Arbitrage detection: spread + model-edge opportunities
 
+Architecture:
+  MarketSnapshot -> [12 Modules] -> RegimeDetector -> GatingPolicy
+                                  -> HybridPredictor -> RegimeGate
+                                  -> MonteCarloModule -> AutoFix
+                                  -> ForecastResult
 Particle candle enhancements:
   - Event-quantized bars: aggregate by volume/trades/entropy (not clock time)
   - Simplex geometry: B + W_u + W_l = 1 on the candle manifold
@@ -229,6 +235,7 @@ class Forecaster:
                  enable_mc: bool = True,
                  enable_regime_gate: bool = True,
                  enable_hybrid_ml: bool = True,
+                 enable_auto_fix: bool = True):
                  enable_auto_fix: bool = True,
                  enable_particle_candles: bool = True,
                  enable_manifold_patterns: bool = True):
