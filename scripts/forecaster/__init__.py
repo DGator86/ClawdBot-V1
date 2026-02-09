@@ -23,6 +23,15 @@ Usage:
     fc = Forecaster()
     result = fc.forecast("BTCUSDT", horizon_hours=24)
 """
+from .engine import Forecaster, ForecastResult
+from .rl_env import (
+    ForecastTradingEnv,
+    evaluate_forecaster_as_trader,
+    commission_sweep,
+)
+from .ml_models import HybridPredictor, TemporalFeatureExtractor
+from .regime_gate import RegimeGate, ArbitrageDetector
+from .auto_fix import AutoFixPipeline, CalibrationSuite, HealthMonitor
 # Lazy imports to avoid the runpy RuntimeWarning when running
 # ``python -m scripts.forecaster.engine``.  Eager import of .engine
 # in __init__.py puts the module in sys.modules *before* runpy

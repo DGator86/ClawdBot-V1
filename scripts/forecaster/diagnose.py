@@ -317,6 +317,7 @@ def run_diagnosis(n_bars: int = 2000,
     gbm_samples = len(fc_gbm.meta_learner._history)
 
     if verbose:
+        print(f"  Hybrid ML: HR={metrics_gbm.hit_rate:.1%}, "
         print(f"  GBM: HR={metrics_gbm.hit_rate:.1%}, "
               f"MCC={metrics_gbm.mcc:.4f}, "
               f"trained={gbm_trained}, samples={gbm_samples}")
@@ -359,6 +360,7 @@ def run_diagnosis(n_bars: int = 2000,
         for alert in health.alerts:
             print(f"    ALERT:    {alert}")
 
+    # Use enhanced records for remaining diagnostics
     # Use GBM records for remaining diagnostics
     records = records_gbm
 
@@ -727,6 +729,7 @@ def full_diagnostics_and_fix(
 
 def main():
     parser = argparse.ArgumentParser(
+        description="Forecaster Diagnostic Suite (Ultimate Enhanced)")
         description="Forecaster Diagnostic Suite (14-Paradigm)")
     parser.add_argument("--bars", type=int, default=2000)
     parser.add_argument("--forecasts", type=int, default=75)
