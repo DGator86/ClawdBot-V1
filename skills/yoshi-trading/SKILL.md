@@ -59,11 +59,13 @@ curl -s -X POST http://127.0.0.1:8000/pause
 ```
 
 Resume trading:
+
 ```bash
 curl -s -X POST http://127.0.0.1:8000/resume
 ```
 
 Activate kill switch (emergency stop + flatten):
+
 ```bash
 curl -s -X POST http://127.0.0.1:8000/kill-switch
 ```
@@ -98,6 +100,7 @@ cd /root/ClawdBot-V1 && python3 scripts/monte-carlo/simulation.py --iterations 5
 Default is 100,000 iterations and 48 steps. Common requests:
 - "Run 500k MC" → `--iterations 500000`
 - "Run a million iterations" → `--iterations 1000000`
+- "96-step simulation" → `--steps 96`
 - "96 step simulation" → `--steps 96`
 - "Run live MC" → `--live` (uses real market data + full ensemble)
 
@@ -108,7 +111,20 @@ The simulation takes a few seconds. **Wait for it to complete** before respondin
 ```bash
 cat /root/ClawdBot-V1/scripts/monte-carlo/results.json | python3 -c "
 import json, sys
-r = json.load(sys.stdin)
+
+try:
+    r = json.load(sys.stdin)
+except (json.JSONDecodeError, ValueError) as e:
+    print(f'Error: Failed to parse Monte Carlo results JSON: {e}', file=sys.stderr)
+    sys.exit(1)
+
+# Validate required keys
+required_keys = ['meta', 'terminal', 'validation', 'risk', 'input']
+missing_keys = [k for k in required_keys if k not in r]
+if missing_keys:
+    print(f'Error: Incomplete Monte Carlo results - missing keys: {\", \".join(missing_keys)}', file=sys.stderr)
+    sys.exit(1)
+
 m = r['meta']
 t = r['terminal']
 v = r['validation']
@@ -402,7 +418,7 @@ The ensemble combines:
 Check for recent signals:
 
 ```bash
-tail -100 /root/Yoshi-Bot/logs/scanner.log 2>/dev/null || echo "Scanner log not found"
+tail -100 /root/ClawdBot-V1/logs/edge-scanner.log 2>/dev/null || tail -100 /root/Yoshi-Bot/logs/scanner.log 2>/dev/null || echo "Scanner log not found"
 ```
 
 ---

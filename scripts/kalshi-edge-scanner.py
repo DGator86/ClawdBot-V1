@@ -45,6 +45,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib import request, error as urlerror, parse as urlparse
 
+from kalshi_client import KalshiClient
+
 # ── Config ───────────────────────────────────────────────
 TRADING_CORE_URL = os.getenv("TRADING_CORE_URL", "http://127.0.0.1:8000")
 STATE_DIR = Path(__file__).parent.parent  # ClawdBot-V1 root
@@ -255,7 +257,7 @@ class KalshiClient:
 
 
 def load_kalshi_client():
-    """Load env files and return the KalshiClient class."""
+    """Load env files and return a configured KalshiClient instance."""
     # Source all known .env files for credentials
     for env_path in [
         "/root/Yoshi-Bot/.env",
@@ -271,14 +273,13 @@ def load_kalshi_client():
     if not os.environ.get("KALSHI_KEY_ID"):
         raise ImportError("KALSHI_KEY_ID not found in any .env file")
 
-    # Test that we can create a client
+    # Create and return the client instance
     try:
         client = KalshiClient()
         log(f"Kalshi client initialized (key: {client.key_id[:12]}...)")
+        return client
     except Exception as e:
-        raise ImportError(f"Cannot create Kalshi client: {e}")
-
-    return KalshiClient  # Return the class, not instance
+        raise ImportError(f"Cannot create Kalshi client: {e}") from e
 
 
 # ── Price fetching (lightweight, no ccxt dependency) ─────
@@ -551,7 +552,7 @@ def propose_to_core(pick: dict) -> dict | None:
 
 
 # ── Scanner Main Loop ────────────────────────────────────
-def scan_once(kalshi_client, top_n: int = 2) -> list[dict]:
+def scan_once(client: KalshiClient, top_n: int = 2) -> list[dict]:
     """
     Run one full scan cycle:
     1. Check exchange status
@@ -560,7 +561,6 @@ def scan_once(kalshi_client, top_n: int = 2) -> list[dict]:
     4. Score every contract
     5. Return top N picks sorted by composite score
     """
-    client = kalshi_client()
 
     # 1. Exchange status
     ex_status = client.get_exchange_status()
@@ -701,7 +701,7 @@ def main():
 
     # Load Kalshi client
     try:
-        KalshiClient = load_kalshi_client()
+        client = load_kalshi_client()
     except ImportError as e:
         log(str(e), "FATAL")
         sys.exit(1)
@@ -715,7 +715,7 @@ def main():
         log(f"--- Scan #{cycle} ---")
 
         try:
-            picks = scan_once(KalshiClient, top_n=args.top)
+            picks = scan_once(client, top_n=args.top)
         except Exception as e:
             log(f"Scan failed: {e}", "ERROR")
             picks = []
