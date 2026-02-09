@@ -63,6 +63,10 @@ MIN_EV_CENTS = 1.0          # minimum EV in cents per contract
 MAX_CONTRACTS_DEFAULT = 10  # default position size suggestion
 KELLY_FRACTION = 0.25       # quarter-Kelly for safety
 
+# Ensemble mode: if True, skip contracts where ensemble returns None
+# (don't fall back to price-distance heuristic)
+REQUIRE_ENSEMBLE = os.getenv("REQUIRE_ENSEMBLE", "0") == "1"
+
 
 def log(msg: str, level: str = "INFO"):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -377,6 +381,7 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
         except Exception:
             pass
 
+    fallback_reason = None
     if current_price and current_price > 0:
         # ── Try 12-paradigm ensemble first ────────────────
         try:
@@ -393,19 +398,27 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
                 model_prob = ens_prob
                 model_source = ens_source
                 forecast_meta = ens_meta
+            else:
+                fallback_reason = "ensemble_returned_none"
         except ImportError:
-            pass  # forecaster not available, use fallback
+            fallback_reason = "ensemble_import_error"
         except Exception as e:
+            fallback_reason = f"ensemble_error: {e}"
             log(f"Ensemble forecast error for {ticker}: {e}", "WARN")
 
         # ── Fallback: simple price-distance logistic ──────
         if model_prob is None:
+            if REQUIRE_ENSEMBLE:
+                log(f"Skipping {ticker}: ensemble unavailable ({fallback_reason})", "WARN")
+                return None
             dist = (current_price - strike) / current_price
             spread = abs(yes_ask - yes_bid) / 100.0 if (yes_ask > 0 and yes_bid > 0) else 0.05
             hourly_vol = max(spread, 0.005)
             z = dist / hourly_vol if hourly_vol > 0 else 0
             model_prob = 1.0 / (1.0 + math.exp(-1.7 * z))
             model_source = "price-distance"
+            if fallback_reason:
+                log(f"Fallback to price-distance for {ticker}: {fallback_reason}", "INFO")
             if abs(dist) < 0.001:
                 model_prob = 0.50 + (model_prob - 0.50) * 0.5
 
@@ -508,6 +521,7 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
             max(1, min(MAX_CONTRACTS_DEFAULT, int(kelly_safe * 100))) * cost_cents / 100, 2
         ),
         "forecast_meta": forecast_meta,  # ensemble details (empty dict if fallback)
+        "fallback_reason": fallback_reason,  # None if ensemble succeeded
     }
 
 
@@ -694,10 +708,14 @@ def main():
                         help="Send top pick to Trading Core /propose")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON")
+    parser.add_argument("--require-ensemble", action="store_true",
+                        help="Skip contracts where ensemble is unavailable (no price-distance fallback)")
     args = parser.parse_args()
 
-    global MIN_EDGE_PCT
+    global MIN_EDGE_PCT, REQUIRE_ENSEMBLE
     MIN_EDGE_PCT = args.min_edge
+    if args.require_ensemble:
+        REQUIRE_ENSEMBLE = True
 
     # Load Kalshi client
     try:
