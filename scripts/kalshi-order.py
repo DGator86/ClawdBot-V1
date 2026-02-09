@@ -29,13 +29,25 @@ from kalshi_client import KalshiClient
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
 _FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
 
+# Try to use shared utilities
+try:
+    from scripts.lib.pem_utils import fix_pem as _shared_fix_pem, load_env_files as _shared_load_env_files
+    _HAS_SHARED_UTILS = True
+except ImportError:
+    _HAS_SHARED_UTILS = False
+
 
 def load_env():
     """Source .env files for Kalshi credentials.
     
     KALSHI_PRIVATE_KEY is force-overwritten because systemd's
     EnvironmentFile truncates multi-line values to one line.
+    Uses shared pem_utils when available.
     """
+    if _HAS_SHARED_UTILS:
+        _shared_load_env_files()
+        return
+
     for env_path in [
         "/root/Yoshi-Bot/.env",
         "/root/ClawdBot-V1/.env",
@@ -74,6 +86,90 @@ def load_env():
                 logging.warning(f"Failed to load .env from {env_path}: {e}")
                 import traceback
                 logging.debug(traceback.format_exc())
+            except Exception:
+                pass
+
+
+class KalshiClient:
+    """Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth."""
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(self):
+        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
+        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+        if not self.key_id:
+            raise ValueError("KALSHI_KEY_ID not set")
+        if not pk_raw:
+            for pk_path in [
+                os.path.expanduser("~/.kalshi/private_key.pem"),
+                "/root/.kalshi/private_key.pem",
+            ]:
+                if os.path.isfile(pk_path):
+                    with open(pk_path) as f:
+                        pk_raw = f.read().strip()
+                    break
+        if not pk_raw:
+            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
+
+        # Fix PEM formatting — env vars often have literal \n instead of newlines
+        pk_raw = self._fix_pem(pk_raw)
+
+        from cryptography.hazmat.primitives.serialization import load_pem_private_key
+        self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
+
+    @staticmethod
+    def _fix_pem(raw: str) -> str:
+        """Normalize a PEM key. Delegates to shared pem_utils when available."""
+        if _HAS_SHARED_UTILS:
+            return _shared_fix_pem(raw)
+        import re
+        if "\\n" in raw:
+            raw = raw.replace("\\n", "\n")
+        if "-----BEGIN" in raw and raw.count("\n") <= 2:
+            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
+            if m:
+                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
+                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
+                if header_match and footer_match:
+                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
+                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
+            return raw.strip()
+        if "-----BEGIN" not in raw:
+            body = re.sub(r"\s+", "", raw)
+            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
+                lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
+        return raw.strip()
+
+    def _sign(self, method: str, path: str, body: str = "") -> dict:
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        timestamp = str(int(time.time() * 1000))
+        message = timestamp + method + path + body
+        signature = self.private_key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        }
+
+    def _request(self, method: str, path: str, body: str = ""):
+        headers = self._sign(method, path, body)
+        url = self.BASE_URL + path
+        data = body.encode() if body else None
+        req = request.Request(url, data=data, headers=headers, method=method)
+        with request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode())
 
 
 def place_order(client, ticker, side, count, order_type="market", price=None):

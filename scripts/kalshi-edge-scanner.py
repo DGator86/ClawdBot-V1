@@ -76,9 +76,16 @@ def log(msg: str, level: str = "INFO"):
         pass
 
 
-# ── .env loader ──────────────────────────────────────────
+# ── .env loader (uses shared pem_utils when available) ───
 # Keys that must be overwritten (systemd EnvironmentFile mangles multi-line PEM)
 _FORCE_OVERWRITE_KEYS = {"KALSHI_PRIVATE_KEY"}
+
+# Try to use shared utilities
+try:
+    from scripts.lib.pem_utils import fix_pem as _shared_fix_pem, load_env_file as _shared_load_env
+    _HAS_SHARED_UTILS = True
+except ImportError:
+    _HAS_SHARED_UTILS = False
 
 
 def _source_env(path: str):
@@ -116,6 +123,137 @@ def _source_env(path: str):
                         os.environ.setdefault(key, val)
     except Exception:
         pass
+
+
+# ── Standalone Kalshi API Client ─────────────────────────
+class KalshiClient:
+    """
+    Standalone Kalshi V2 API client with RSA-PSS SHA-256 auth.
+    No external dependencies beyond `cryptography` (system package).
+    
+    Reads KALSHI_KEY_ID and KALSHI_PRIVATE_KEY from environment.
+    """
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+
+    def __init__(self):
+        self.key_id = os.environ.get("KALSHI_KEY_ID", "").strip()
+        pk_raw = os.environ.get("KALSHI_PRIVATE_KEY", "").strip()
+        if not self.key_id:
+            raise ValueError("KALSHI_KEY_ID not set")
+        if not pk_raw:
+            # Try loading from file
+            for pk_path in [
+                os.path.expanduser("~/.kalshi/private_key.pem"),
+                "/root/.kalshi/private_key.pem",
+            ]:
+                if os.path.isfile(pk_path):
+                    with open(pk_path) as f:
+                        pk_raw = f.read().strip()
+                    break
+        if not pk_raw:
+            raise ValueError("KALSHI_PRIVATE_KEY not set and no PEM file found")
+
+        # Fix PEM formatting — env vars often have literal \n instead of newlines
+        pk_raw = self._fix_pem(pk_raw)
+
+        # Load the RSA private key
+        try:
+            from cryptography.hazmat.primitives.serialization import load_pem_private_key
+            self.private_key = load_pem_private_key(pk_raw.encode(), password=None)
+        except ImportError:
+            raise ImportError(
+                "cryptography package not installed. Run: pip3 install cryptography"
+            )
+
+    @staticmethod
+    def _fix_pem(raw: str) -> str:
+        """
+        Normalize a PEM key that may have been mangled by env var storage.
+        Delegates to shared pem_utils when available; falls back to inline logic.
+        """
+        if _HAS_SHARED_UTILS:
+            return _shared_fix_pem(raw)
+
+        import re
+
+        # Replace literal \n with real newlines
+        if "\\n" in raw:
+            raw = raw.replace("\\n", "\n")
+
+        # If it has PEM headers but is mangled onto one/two lines
+        if "-----BEGIN" in raw and raw.count("\n") <= 2:
+            m = re.search(r"-----BEGIN [A-Z ]+-----\s*(.*?)\s*-----END [A-Z ]+-----", raw, re.DOTALL)
+            if m:
+                header_match = re.search(r"(-----BEGIN [A-Z ]+-----)", raw)
+                footer_match = re.search(r"(-----END [A-Z ]+-----)", raw)
+                if header_match and footer_match:
+                    body = m.group(1).replace(" ", "").replace("\n", "").replace("\r", "")
+                    lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                    raw = header_match.group(1) + "\n" + "\n".join(lines) + "\n" + footer_match.group(1)
+            return raw.strip()
+
+        # NO PEM headers — raw base64 (possibly with spaces instead of newlines)
+        if "-----BEGIN" not in raw:
+            # Strip all whitespace to get clean base64
+            body = re.sub(r"\s+", "", raw)
+            # Validate it looks like base64
+            if len(body) > 100 and re.match(r"^[A-Za-z0-9+/=]+$", body):
+                # Wrap at 64 chars and add RSA PRIVATE KEY headers
+                lines = [body[i:i+64] for i in range(0, len(body), 64)]
+                raw = "-----BEGIN RSA PRIVATE KEY-----\n" + "\n".join(lines) + "\n-----END RSA PRIVATE KEY-----"
+
+        return raw.strip()
+
+    def _sign(self, method: str, path: str, body: str = "") -> dict:
+        """Create authenticated headers for a Kalshi API request."""
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import padding
+
+        timestamp = str(int(time.time() * 1000))
+        message = timestamp + method + path + body
+        signature = self.private_key.sign(
+            message.encode(),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.DIGEST_LENGTH,
+            ),
+            hashes.SHA256(),
+        )
+        return {
+            "Content-Type": "application/json",
+            "KALSHI-ACCESS-KEY": self.key_id,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(signature).decode(),
+            "KALSHI-ACCESS-TIMESTAMP": timestamp,
+        }
+
+    def _request(self, method: str, path: str, body: str = ""):
+        """Make an authenticated HTTP request to Kalshi."""
+        headers = self._sign(method, path, body)
+        url = self.BASE_URL + path
+        data = body.encode() if body else None
+        req = request.Request(url, data=data, headers=headers, method=method)
+        try:
+            with request.urlopen(req, timeout=15) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            log(f"Kalshi API error ({method} {path}): {e}", "ERROR")
+            return None
+
+    def get_exchange_status(self) -> dict | None:
+        return self._request("GET", "/exchange/status")
+
+    def list_markets(self, limit: int = 200, **kwargs) -> list[dict]:
+        params = {"limit": str(limit)}
+        for k, v in kwargs.items():
+            params[k] = str(v)
+        qs = urlparse.urlencode(params)
+        result = self._request("GET", f"/markets?{qs}")
+        if result and "markets" in result:
+            return result["markets"]
+        return result if isinstance(result, list) else []
+
+    def get_market(self, ticker: str) -> dict | None:
+        return self._request("GET", f"/markets/{ticker}")
 
 
 def load_kalshi_client():
@@ -221,36 +359,55 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
     strike = float(strike)
 
     # ── Model probability estimate ───────────────────────
-    # If we have current price, we estimate probability that price
-    # will be above the strike at contract expiry.
-    # Simple approach: distance from strike as a z-score using
-    # recent implied vol from the market's own spread.
+    # Try ensemble forecaster first (12-paradigm), fall back to
+    # simple price-distance logistic if ensemble unavailable.
     model_prob = None
     model_source = "none"
+    forecast_meta = {}
+
+    # Determine horizon from contract expiry
+    close_time = market.get("close_time") or market.get("expiration_time") or ""
+    horizon_hours = 24.0  # default
+    if close_time:
+        try:
+            from datetime import datetime, timezone
+            exp = datetime.fromisoformat(close_time.replace("Z", "+00:00"))
+            delta = exp - datetime.now(timezone.utc)
+            horizon_hours = max(1.0, delta.total_seconds() / 3600)
+        except Exception:
+            pass
 
     if current_price and current_price > 0:
-        # Distance to strike as fraction of price
-        dist = (current_price - strike) / current_price
+        # ── Try 12-paradigm ensemble first ────────────────
+        try:
+            from scripts.forecaster.bridge import get_ensemble_model_prob
+            series = market.get("series_ticker", "")
+            symbol = SYMBOL_MAP.get(series, "BTCUSDT")
+            ens_prob, ens_source, ens_meta = get_ensemble_model_prob(
+                symbol=symbol,
+                strike=strike,
+                current_price=current_price,
+                horizon_hours=horizon_hours,
+            )
+            if ens_prob is not None:
+                model_prob = ens_prob
+                model_source = ens_source
+                forecast_meta = ens_meta
+        except ImportError:
+            pass  # forecaster not available, use fallback
+        except Exception as e:
+            log(f"Ensemble forecast error for {ticker}: {e}", "WARN")
 
-        # Use market-implied vol from the spread width
-        spread = abs(yes_ask - yes_bid) / 100.0 if (yes_ask > 0 and yes_bid > 0) else 0.05
-        # Hourly vol estimate: spread gives us a rough idea
-        hourly_vol = max(spread, 0.005)  # floor at 0.5%
-
-        # For "above strike" contracts:
-        # If current price > strike, base prob is > 50%
-        # z = distance / vol (positive means price is above strike)
-        z = dist / hourly_vol if hourly_vol > 0 else 0
-
-        # Convert to probability using logistic approximation
-        # (faster than importing scipy)
-        model_prob = 1.0 / (1.0 + math.exp(-1.7 * z))
-        model_source = "price-distance"
-
-        # Adjust for momentum: if price is well above strike,
-        # increase confidence; if barely above, decrease
-        if abs(dist) < 0.001:  # very close to strike — uncertainty
-            model_prob = 0.50 + (model_prob - 0.50) * 0.5  # pull toward 50%
+        # ── Fallback: simple price-distance logistic ──────
+        if model_prob is None:
+            dist = (current_price - strike) / current_price
+            spread = abs(yes_ask - yes_bid) / 100.0 if (yes_ask > 0 and yes_bid > 0) else 0.05
+            hourly_vol = max(spread, 0.005)
+            z = dist / hourly_vol if hourly_vol > 0 else 0
+            model_prob = 1.0 / (1.0 + math.exp(-1.7 * z))
+            model_source = "price-distance"
+            if abs(dist) < 0.001:
+                model_prob = 0.50 + (model_prob - 0.50) * 0.5
 
     if model_prob is None:
         return None
@@ -350,6 +507,7 @@ def compute_edge(market: dict, current_price: float | None) -> dict | None:
         "max_cost_dollars": round(
             max(1, min(MAX_CONTRACTS_DEFAULT, int(kelly_safe * 100))) * cost_cents / 100, 2
         ),
+        "forecast_meta": forecast_meta,  # ensemble details (empty dict if fallback)
     }
 
 

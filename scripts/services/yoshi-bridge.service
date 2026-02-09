@@ -1,0 +1,27 @@
+[Unit]
+Description=Yoshi Bridge — Scanner Log to Trading Core
+After=network.target
+PartOf=clawdbot.service
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ClawdBot-V1
+EnvironmentFile=-/root/ClawdBot-V1/.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=TRADING_CORE_URL=http://127.0.0.1:8000
+
+# Bridge watches scanner logs and forwards to Trading Core /propose
+ExecStart=/usr/bin/python3 scripts/yoshi-bridge.py --poll-interval 30
+
+Restart=always
+RestartSec=15
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=yoshi-bridge
+
+[Install]
+WantedBy=multi-user.target

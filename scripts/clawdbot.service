@@ -1,19 +1,43 @@
+# DEPRECATED: Use scripts/services/clawdbot.service instead.
+# Install all services: bash scripts/services/install.sh --start
+#
+# This file is kept for backward compatibility.
+# The canonical service files are in scripts/services/
+#
+# Ultimate-fix: Added ExecStartPre for full_diagnostics_and_fix
+# This runs diagnostics + auto-calibration + health check on every service start.
+
 [Unit]
-Description=ClawdBot — Telegram AI Trading Assistant
+Description=ClawdBot Telegram AI Trading Assistant
 After=network.target
+Wants=kalshi-edge-scanner.service yoshi-bridge.service
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=/root/ClawdBot-V1
+EnvironmentFile=-/root/ClawdBot-V1/.env
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 Environment=NODE_ENV=production
-EnvironmentFile=/root/ClawdBot-V1/.env
-ExecStart=/usr/bin/moltbot gateway --port 18789
+ExecStartPre=-/usr/bin/fuser -k -9 18789/tcp
+ExecStartPre=/bin/sleep 1
+ExecStartPre=/usr/bin/python3 /root/ClawdBot-V1/scripts/rebuild-config.py --quiet
+# Ultimate-fix: Run diagnostics + auto-fix on start (non-blocking, '-' prefix allows failure)
+ExecStartPre=-/usr/bin/python3 -m scripts.forecaster.diagnose --bars 500 --forecasts 20 --auto-fix --output /root/ClawdBot-V1/data/diagnostics_report.json
+ExecStart=/usr/local/bin/moltbot gateway --port 18789
 Restart=always
 RestartSec=10
+StartLimitIntervalSec=300
+StartLimitBurst=5
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=clawdbot
+
+# Security hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/root /home/root /tmp
+ProtectHome=no
 
 [Install]
 WantedBy=multi-user.target
